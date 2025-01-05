@@ -1,8 +1,7 @@
-use proto::bottles_server::{Bottles, BottlesServer};
-
-mod proto {
-    tonic::include_proto!("bottles");
-}
+use bottles_core::proto::{
+    self,
+    bottles_server::{Bottles, BottlesServer},
+};
 
 #[derive(Debug, Default)]
 struct BottlesService;
