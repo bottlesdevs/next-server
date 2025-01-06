@@ -4,6 +4,11 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-bottles-core = { git = "https://github.com/bottlesdevs/next-core" }
-tokio = { version = "1.42.0", features = ["full"] }
+bottles-core = { git = "https://github.com/bottlesdevs/next-core", features = [
+    "server",
+] }
 tonic = "0.12.3"
+tokio = { version = "1.42.0", features = ["full"] }
+
+# [patch."https://github.com/bottlesdevs/next-core"]
+# bottles-core = { path = "../next-core" }
