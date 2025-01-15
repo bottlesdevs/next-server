@@ -1,4 +1,5 @@
-use bottles_core::{proto::bottles_server::BottlesServer, server::BottlesService};
+use bottles_core::proto::bottles_server::BottlesServer;
+use bottles_server::BottlesService;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {

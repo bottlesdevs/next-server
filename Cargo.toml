@@ -1,14 +1,18 @@
 [package]
 name = "bottles-server"
-version = "0.1.0"
-edition = "2021"
+version.workspace = true
+description.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+categories.workspace = true
+keywords.workspace = true
+exclude.workspace = true
+readme.workspace = true
 
 [dependencies]
-bottles-core = { git = "https://github.com/bottlesdevs/next-core", features = [
-    "server",
-] }
-tonic = "0.12.3"
-tokio = { version = "1.42.0", features = ["full"] }
-
-# [patch."https://github.com/bottlesdevs/next-core"]
-# bottles-core = { path = "../next-core" }
+bottles-core = { workspace = true }
+tonic = { workspace = true }
+tokio = { workspace = true }
