@@ -10,7 +10,7 @@ impl Bottles for BottlesService {
         request: tonic::Request<proto::HealthRequest>,
     ) -> Result<tonic::Response<proto::HealthResponse>, tonic::Status> {
         let request = request.get_ref();
-        println!("Received request: {:?}", request);
+        tracing::info!("Received request: {:?}", request);
         Ok(tonic::Response::new(proto::HealthResponse { ok: true }))
     }
 
@@ -19,7 +19,7 @@ impl Bottles for BottlesService {
         request: tonic::Request<proto::NotifyRequest>,
     ) -> Result<tonic::Response<proto::NotifyResponse>, tonic::Status> {
         let request = request.get_ref();
-        println!("Received request: {:?}", request);
+        tracing::info!("Received request: {:?}", request);
         let mut client = WineBridgeClient::connect("http://[::1]:50051")
             .await
             .map_err(|e| tonic::Status::from_error(Box::new(e)))?;
