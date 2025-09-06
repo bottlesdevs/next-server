@@ -16,3 +16,4 @@ readme.workspace = true
 bottles-core = { workspace = true }
 tonic = { workspace = true }
 tokio = { workspace = true }
+tracing-subscriber = "0.3.20"
