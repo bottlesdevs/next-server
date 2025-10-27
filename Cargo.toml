@@ -16,4 +16,5 @@ readme.workspace = true
 bottles-core.workspace = true
 tonic.workspace = true
 tokio.workspace = true
+tracing.workspace = true
 tracing-subscriber.workspace = true

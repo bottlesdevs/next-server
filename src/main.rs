@@ -1,5 +1,6 @@
 use bottles_core::proto::bottles_server::BottlesServer;
 use bottles_server::BottlesService;
+use tracing_subscriber::EnvFilter;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
