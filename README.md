@@ -1,5 +1,5 @@
 # Bottles Next Server
-The source code of the Next server.
+A gRPC server for the Bottles Next Wine and Proton environment management.
 
 ## Usage
 Call the server using [grpcurl](https://github.com/fullstorydev/grpcurl) or any gRPC client.

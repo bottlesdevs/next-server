@@ -1,16 +1,15 @@
 [package]
 name = "bottles-server"
+description = "A gRPC server for the Bottles Next Wine and Proton environment management."
 version.workspace = true
-description.workspace = true
 authors.workspace = true
 edition.workspace = true
 license.workspace = true
-repository.workspace = true
-homepage.workspace = true
-categories.workspace = true
-keywords.workspace = true
-exclude.workspace = true
-readme.workspace = true
+repository = "https://github.com/bottlesdevs/next-server/"
+homepage = ""
+categories = [""]
+keywords = [""]
+exclude = [""]
 
 [dependencies]
 bottles-core.workspace = true
