@@ -10,7 +10,7 @@ use next_proto::bottles::{
         ActivationOutcome, CreateProfileRequest, DeleteProfileRequest, GetActiveProfileResponse,
         GetProfileRequest, LinkAccountRequest, LinkSteamAccountRequest, ListProfilesResponse,
         ProfileEvent, RenameProfileRequest, SteamLink, SteamSessionEvent, UnlinkAccountRequest,
-        UnlinkSteamAccountRequest, UserProfile, profile_server::Profile,
+        UnlinkSteamAccountRequest, UserProfile, profile_event, profile_server::Profile,
     },
     registry::v1::{ResolvePluginRequest, registry_client::RegistryClient},
     store::v1::{
@@ -20,9 +20,12 @@ use next_proto::bottles::{
 };
 use prost_wkt_types::Timestamp;
 use serde::{Deserialize, Serialize};
-use tokio::sync::{Mutex, RwLock};
+use tokio::sync::{Mutex, RwLock, broadcast};
+use tokio_stream::{StreamExt, wrappers::BroadcastStream};
 use tonic::{Request, Response, Result, Status, async_trait, transport::Channel};
 use uuid::Uuid;
+
+const EVENTS_CAPACITY: usize = 16;
 
 const PROFILES_FILE: &str = "profiles.toml";
 
@@ -47,6 +50,7 @@ pub struct ProfileService {
     path: PathBuf,
     state: RwLock<ProfilesConfig>,
     registry: Mutex<RegistryClient<Channel>>,
+    events: broadcast::Sender<ProfileEvent>,
 }
 
 impl ProfileService {
@@ -68,10 +72,13 @@ impl ProfileService {
             }
         };
 
+        let (events, _) = broadcast::channel(EVENTS_CAPACITY);
+
         Ok(Self {
             path,
             state: RwLock::new(state),
             registry: Mutex::new(registry),
+            events,
         })
     }
 
@@ -83,6 +90,29 @@ impl ProfileService {
 
     fn not_found(profile_id: &str) -> Status {
         Status::not_found(format!("no profile with id {profile_id}"))
+    }
+
+    /// Broadcasts a profile event to any active WatchActiveProfile
+    /// subscribers. No-op (aside from the send failing silently) when
+    /// nobody's currently watching.
+    fn emit_updated(&self, profile: &UserProfile) {
+        let _ = self.events.send(ProfileEvent {
+            event: Some(profile_event::Event::Updated(profile.clone())),
+        });
+    }
+
+    fn emit_activated(&self, profile: &UserProfile) {
+        let _ = self.events.send(ProfileEvent {
+            event: Some(profile_event::Event::Activated(profile.clone())),
+        });
+    }
+
+    fn emit_deleted(&self, profile_id: &str) {
+        let _ = self.events.send(ProfileEvent {
+            event: Some(profile_event::Event::DeletedProfileId(
+                profile_id.to_string(),
+            )),
+        });
     }
 
     /// Resolves `storefront` to its owning plugin via the Registry and
@@ -164,6 +194,7 @@ impl Profile for ProfileService {
 
         state.profiles.push(profile.clone());
         self.persist(&state).await?;
+        self.emit_updated(&profile);
 
         Ok(Response::new(profile))
     }
@@ -186,6 +217,7 @@ impl Profile for ProfileService {
         }
 
         self.persist(&state).await?;
+        self.emit_deleted(&profile_id);
         Ok(Response::new(()))
     }
 
@@ -205,6 +237,7 @@ impl Profile for ProfileService {
         let profile = profile.clone();
 
         self.persist(&state).await?;
+        self.emit_updated(&profile);
         Ok(Response::new(profile))
     }
 
@@ -320,6 +353,7 @@ impl Profile for ProfileService {
 
         state.active_profile_id = Some(req.profile_id);
         self.persist(&state).await?;
+        self.emit_activated(&profile);
 
         Ok(Response::new(ActivateProfileResponse {
             profile: Some(profile),
@@ -366,6 +400,7 @@ impl Profile for ProfileService {
         let profile = profile.clone();
 
         self.persist(&state).await?;
+        self.emit_updated(&profile);
         Ok(Response::new(profile))
     }
 
@@ -419,6 +454,7 @@ impl Profile for ProfileService {
         let profile = profile.clone();
 
         self.persist(&state).await?;
+        self.emit_updated(&profile);
         Ok(Response::new(profile))
     }
 
@@ -441,6 +477,7 @@ impl Profile for ProfileService {
         let profile = profile.clone();
 
         self.persist(&state).await?;
+        self.emit_updated(&profile);
         Ok(Response::new(profile))
     }
 
@@ -460,36 +497,44 @@ impl Profile for ProfileService {
         let profile = profile.clone();
 
         self.persist(&state).await?;
+        self.emit_updated(&profile);
         Ok(Response::new(profile))
     }
 
     type WatchActiveProfileStream =
         Pin<Box<dyn Stream<Item = Result<ProfileEvent, Status>> + Send + 'static>>;
 
-    /// Server-streaming: UI subscribes instead of polling.
+    /// Server-streaming: UI subscribes instead of polling. Emits the
+    /// current active profile (if any) as an initial Activated event, then
+    /// forwards every subsequent mutation broadcast by the RPCs above.
     async fn watch_active_profile(
         &self,
         _request: Request<()>,
     ) -> Result<Response<Self::WatchActiveProfileStream>, Status> {
-        // TODO: replace with a real broadcast channel fed by every mutation
-        // above, instead of a one-shot snapshot of the current state.
-        let state = self.state.read().await;
-        let active = state.active_profile_id.as_deref().and_then(|id| {
-            state
-                .profiles
-                .iter()
-                .find(|profile| profile.id == id)
-                .cloned()
+        // Subscribe before reading state so no event can land in the gap
+        // between snapshotting "current" and starting to listen for "next".
+        let receiver = self.events.subscribe();
+
+        let initial = {
+            let state = self.state.read().await;
+            state.active_profile_id.as_deref().and_then(|id| {
+                state
+                    .profiles
+                    .iter()
+                    .find(|profile| profile.id == id)
+                    .cloned()
+            })
+        }
+        .map(|profile| ProfileEvent {
+            event: Some(profile_event::Event::Activated(profile)),
         });
-        let events = match active {
-            Some(profile) => vec![Ok(ProfileEvent {
-                event: Some(
-                    next_proto::bottles::profiles::v1::profile_event::Event::Activated(profile),
-                ),
-            })],
-            None => Vec::new(),
-        };
-        let stream = tokio_stream::iter(events);
+
+        // A lagged receiver just means this subscriber missed some events
+        // under backpressure — skip the gap rather than erroring the whole
+        // stream out from under the caller.
+        let live = BroadcastStream::new(receiver).filter_map(|item| item.ok());
+
+        let stream = tokio_stream::iter(initial).chain(live).map(Ok);
         Ok(Response::new(Box::pin(stream)))
     }
 
