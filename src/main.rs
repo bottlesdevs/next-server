@@ -40,12 +40,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let store_registry_client = RegistryClient::connect(REGISTRY_ENDPOINT).await?;
     let store_service = StoreService::new(store_registry_client);
 
+    let profile_service = ProfileService::new().await?;
+
     tracing::info!("Server started on http://{LISTEN_ADDR}");
 
     tonic::transport::Server::builder()
         .add_service(health_service)
         .add_service(reflection_service)
-        .add_service(ProfileServer::new(ProfileService::new()))
+        .add_service(ProfileServer::new(profile_service))
         .add_service(LibraryServer::new(library_service))
         .add_service(StoreServer::new(store_service))
         .serve(LISTEN_ADDR.parse()?)
