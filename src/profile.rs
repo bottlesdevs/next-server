@@ -3,16 +3,22 @@ use std::{path::PathBuf, pin::Pin};
 use directories::ProjectDirs;
 use futures_core::Stream;
 use next_config::Config;
-use next_proto::bottles::profiles::v1::{
-    ActivateProfileRequest, ActivateProfileResponse, CreateProfileRequest, DeleteProfileRequest,
-    GetActiveProfileResponse, GetProfileRequest, LinkSteamAccountRequest, ListProfilesResponse,
-    ProfileEvent, RenameProfileRequest, SteamLink, SteamSessionEvent, UnlinkAccountRequest,
-    UnlinkSteamAccountRequest, UserProfile, profile_server::Profile,
+use next_proto::bottles::{
+    common::v1::{AuthState, Storefront},
+    profiles::v1::{
+        AccountActivationResult, ActivateProfileRequest, ActivateProfileResponse,
+        ActivationOutcome, CreateProfileRequest, DeleteProfileRequest, GetActiveProfileResponse,
+        GetProfileRequest, LinkSteamAccountRequest, ListProfilesResponse, ProfileEvent,
+        RenameProfileRequest, SteamLink, SteamSessionEvent, UnlinkAccountRequest,
+        UnlinkSteamAccountRequest, UserProfile, profile_server::Profile,
+    },
+    registry::v1::{ResolvePluginRequest, registry_client::RegistryClient},
+    store::v1::{RefreshSessionRequest, RevokeSessionRequest, store_client::StoreClient},
 };
 use prost_wkt_types::Timestamp;
 use serde::{Deserialize, Serialize};
-use tokio::sync::RwLock;
-use tonic::{Request, Response, Result, Status, async_trait};
+use tokio::sync::{Mutex, RwLock};
+use tonic::{Request, Response, Result, Status, async_trait, transport::Channel};
 use uuid::Uuid;
 
 const PROFILES_FILE: &str = "profiles.toml";
@@ -37,10 +43,11 @@ fn now() -> Timestamp {
 pub struct ProfileService {
     path: PathBuf,
     state: RwLock<ProfilesConfig>,
+    registry: Mutex<RegistryClient<Channel>>,
 }
 
 impl ProfileService {
-    pub async fn new() -> Result<Self, Status> {
+    pub async fn new(registry: RegistryClient<Channel>) -> Result<Self, Status> {
         let path = profiles_path()?;
 
         let state = match next_config::load::<ProfilesConfig>(&path).await {
@@ -61,6 +68,7 @@ impl ProfileService {
         Ok(Self {
             path,
             state: RwLock::new(state),
+            registry: Mutex::new(registry),
         })
     }
 
@@ -72,6 +80,38 @@ impl ProfileService {
 
     fn not_found(profile_id: &str) -> Status {
         Status::not_found(format!("no profile with id {profile_id}"))
+    }
+
+    /// Resolves `storefront` to its owning plugin via the Registry and
+    /// dials a fresh Store client — same pattern as StoreService, kept
+    /// separate since ProfileService needs its own Registry connection.
+    async fn store_client_for(
+        &self,
+        storefront: Storefront,
+    ) -> Result<Option<StoreClient<Channel>>, Status> {
+        let resolved = {
+            let mut registry = self.registry.lock().await;
+            registry
+                .resolve_plugin(ResolvePluginRequest {
+                    storefront: storefront as i32,
+                })
+                .await?
+                .into_inner()
+        };
+
+        let Some(endpoint) = resolved.endpoint else {
+            return Ok(None);
+        };
+
+        let client = StoreClient::connect(endpoint.clone())
+            .await
+            .map_err(|err| {
+                Status::unavailable(format!(
+                    "failed to dial {storefront:?} plugin at {endpoint}: {err}"
+                ))
+            })?;
+
+        Ok(Some(client))
     }
 }
 
@@ -190,26 +230,97 @@ impl Profile for ProfileService {
         request: Request<ActivateProfileRequest>,
     ) -> Result<Response<ActivateProfileResponse>, Status> {
         let req = request.into_inner();
-        let mut state = self.state.write().await;
 
+        let accounts = {
+            let state = self.state.read().await;
+            let profile = state
+                .profiles
+                .iter()
+                .find(|profile| profile.id == req.profile_id)
+                .ok_or_else(|| Self::not_found(&req.profile_id))?;
+            profile.accounts.clone()
+        };
+
+        let targets = accounts.into_iter().filter(|account| {
+            req.only.is_empty() || req.only.contains(&account.storefront)
+        });
+
+        let mut results = Vec::new();
+        // Ok(account) replaces the stored LinkedAccount with the refreshed
+        // one; Err marks it stale in place without touching other fields.
+        let mut updates: std::collections::HashMap<i32, std::result::Result<_, ()>> =
+            std::collections::HashMap::new();
+
+        for account in targets {
+            let Ok(storefront) = Storefront::try_from(account.storefront) else {
+                continue;
+            };
+
+            let outcome = match self.store_client_for(storefront).await {
+                Ok(Some(mut client)) => {
+                    match client
+                        .refresh_session(RefreshSessionRequest {
+                            profile_id: req.profile_id.clone(),
+                            storefront: account.storefront,
+                        })
+                        .await
+                    {
+                        Ok(response) => {
+                            updates.insert(account.storefront, Ok(response.into_inner()));
+                            AccountActivationResult {
+                                storefront: account.storefront,
+                                outcome: ActivationOutcome::Success as i32,
+                                detail: String::new(),
+                            }
+                        }
+                        Err(err) => {
+                            updates.insert(account.storefront, Err(()));
+                            AccountActivationResult {
+                                storefront: account.storefront,
+                                outcome: ActivationOutcome::CredentialStale as i32,
+                                detail: err.message().to_string(),
+                            }
+                        }
+                    }
+                }
+                Ok(None) => AccountActivationResult {
+                    storefront: account.storefront,
+                    outcome: ActivationOutcome::PluginUnavailable as i32,
+                    detail: format!("no plugin registered for {storefront:?}"),
+                },
+                Err(err) => AccountActivationResult {
+                    storefront: account.storefront,
+                    outcome: ActivationOutcome::NetworkError as i32,
+                    detail: err.message().to_string(),
+                },
+            };
+
+            results.push(outcome);
+        }
+
+        let mut state = self.state.write().await;
         let profile = state
             .profiles
             .iter_mut()
             .find(|profile| profile.id == req.profile_id)
             .ok_or_else(|| Self::not_found(&req.profile_id))?;
+
+        for account in &mut profile.accounts {
+            match updates.remove(&account.storefront) {
+                Some(Ok(refreshed)) => *account = refreshed,
+                Some(Err(())) => account.auth_state = AuthState::Stale as i32,
+                None => {}
+            }
+        }
         profile.last_activated_at = Some(now());
         let profile = profile.clone();
 
         state.active_profile_id = Some(req.profile_id);
         self.persist(&state).await?;
 
-        // TODO: for each of profile.accounts (filtered by req.only, if
-        // non-empty), resolve the owning plugin via Registry and call
-        // Store.RefreshSession, folding the outcome into `results` below.
-        // Left as a stub until StoreService is reachable from here.
         Ok(Response::new(ActivateProfileResponse {
             profile: Some(profile),
-            results: Vec::new(),
+            results,
         }))
     }
 
@@ -218,8 +329,29 @@ impl Profile for ProfileService {
         request: Request<UnlinkAccountRequest>,
     ) -> Result<Response<UserProfile>, Status> {
         let req = request.into_inner();
-        let mut state = self.state.write().await;
 
+        // Best-effort: revoke on the owning plugin before dropping the
+        // LinkedAccount. A plugin that's unreachable shouldn't block
+        // unlinking on our side — log and proceed regardless.
+        if let Ok(storefront) = Storefront::try_from(req.storefront) {
+            match self.store_client_for(storefront).await {
+                Ok(Some(mut client)) => {
+                    if let Err(err) = client
+                        .revoke_session(RevokeSessionRequest {
+                            profile_id: req.profile_id.clone(),
+                            storefront: req.storefront,
+                        })
+                        .await
+                    {
+                        tracing::warn!("{storefront:?} RevokeSession failed: {err}");
+                    }
+                }
+                Ok(None) => tracing::debug!("no plugin registered for {storefront:?}, skipping revoke"),
+                Err(err) => tracing::warn!("failed to reach {storefront:?} plugin: {err}"),
+            }
+        }
+
+        let mut state = self.state.write().await;
         let profile = state
             .profiles
             .iter_mut()
@@ -231,10 +363,6 @@ impl Profile for ProfileService {
         let profile = profile.clone();
 
         self.persist(&state).await?;
-
-        // TODO: resolve the owning plugin via Registry and call
-        // Store.RevokeSession before dropping the LinkedAccount above, so
-        // the plugin's own stored credentials are cleaned up too.
         Ok(Response::new(profile))
     }
 

@@ -40,7 +40,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let store_registry_client = RegistryClient::connect(REGISTRY_ENDPOINT).await?;
     let store_service = StoreService::new(store_registry_client);
 
-    let profile_service = ProfileService::new().await?;
+    let profile_registry_client = RegistryClient::connect(REGISTRY_ENDPOINT).await?;
+    let profile_service = ProfileService::new(profile_registry_client).await?;
 
     tracing::info!("Server started on http://{LISTEN_ADDR}");
 
