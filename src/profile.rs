@@ -458,25 +458,62 @@ impl Profile for ProfileService {
         Ok(Response::new(profile))
     }
 
+    /// Links a Steam account by ID. Looks up the display name from the
+    /// local Steam install's loginusers.vdf on a best-effort basis (empty
+    /// if Steam isn't installed or the ID isn't found there). When
+    /// `auto_activate` is set, immediately runs the same activation path
+    /// as ActivateProfile so linked storefront accounts get refreshed too.
     async fn link_steam_account(
         &self,
         request: Request<LinkSteamAccountRequest>,
     ) -> Result<Response<UserProfile>, Status> {
         let req = request.into_inner();
-        let mut state = self.state.write().await;
 
+        let account_name = {
+            let steam_id64 = req.steam_id64.clone();
+            tokio::task::spawn_blocking(move || crate::steam::account_name_for(&steam_id64))
+                .await
+                .ok()
+                .flatten()
+                .unwrap_or_default()
+        };
+
+        {
+            let mut state = self.state.write().await;
+            let profile = state
+                .profiles
+                .iter_mut()
+                .find(|profile| profile.id == req.profile_id)
+                .ok_or_else(|| Self::not_found(&req.profile_id))?;
+            profile.steam_link = Some(SteamLink {
+                steam_id64: req.steam_id64.clone(),
+                account_name,
+            });
+            self.persist(&state).await?;
+        }
+
+        if req.auto_activate {
+            let activated = self
+                .activate_profile(Request::new(ActivateProfileRequest {
+                    profile_id: req.profile_id.clone(),
+                    only: Vec::new(),
+                }))
+                .await?
+                .into_inner();
+            let profile = activated
+                .profile
+                .ok_or_else(|| Status::internal("activation didn't return a profile"))?;
+            return Ok(Response::new(profile));
+        }
+
+        let state = self.state.read().await;
         let profile = state
             .profiles
-            .iter_mut()
+            .iter()
             .find(|profile| profile.id == req.profile_id)
+            .cloned()
             .ok_or_else(|| Self::not_found(&req.profile_id))?;
-        profile.steam_link = Some(SteamLink {
-            steam_id64: req.steam_id64,
-            account_name: String::new(),
-        });
-        let profile = profile.clone();
-
-        self.persist(&state).await?;
+        drop(state);
         self.emit_updated(&profile);
         Ok(Response::new(profile))
     }
@@ -550,8 +587,6 @@ impl Profile for ProfileService {
         &self,
         _request: Request<()>,
     ) -> Result<Response<Self::WatchSteamSessionsStream>, Status> {
-        // TODO: real filesystem watch on Steam's loginusers.vdf/registry.vdf.
-        let stream = tokio_stream::iter(Vec::new());
-        Ok(Response::new(Box::pin(stream)))
+        Ok(Response::new(crate::steam::watch_active_user()))
     }
 }

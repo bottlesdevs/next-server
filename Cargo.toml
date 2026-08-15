@@ -30,3 +30,5 @@ thiserror.workspace = true
 directories.workspace = true
 uuid.workspace = true
 prost-wkt-types = "0.7.1"
+keyvalues-parser.workspace = true
+notify.workspace = true
