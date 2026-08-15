@@ -5,12 +5,17 @@ use next_proto::bottles::{
     common::v1::Storefront,
     library::v1::{
         GameEvent, ListGamesRequest as LibraryListGamesRequest,
-        ListGamesResponse as LibraryListGamesResponse, WatchGamesRequest, library_server::Library,
+        ListGamesResponse as LibraryListGamesResponse, WatchGamesRequest as LibraryWatchGamesRequest,
+        library_server::Library,
     },
     registry::v1::{ResolvePluginRequest, registry_client::RegistryClient},
-    store::v1::{ListGamesRequest as StoreListGamesRequest, store_client::StoreClient},
+    store::v1::{
+        ListGamesRequest as StoreListGamesRequest, WatchGamesRequest as StoreWatchGamesRequest,
+        store_client::StoreClient,
+    },
 };
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, mpsc};
+use tokio_stream::{StreamExt, wrappers::ReceiverStream};
 use tonic::{Request, Response, Status, async_trait, transport::Channel};
 
 /// Aggregates game libraries across storefronts by resolving each
@@ -116,18 +121,62 @@ impl Library for LibraryService {
     /// Server streaming response type for the WatchGames method.
     type WatchGamesStream = Pin<Box<dyn Stream<Item = Result<GameEvent, Status>> + Send + 'static>>;
 
+    /// Resolves each requested storefront's plugin the same way
+    /// ListGames does, then spawns one forwarding task per storefront
+    /// that pipes its Store.WatchGames stream into a single shared
+    /// channel. One storefront's plugin being unreachable, or its stream
+    /// ending/erroring, doesn't affect the others.
     async fn watch_games(
         &self,
-        request: Request<WatchGamesRequest>,
+        request: Request<LibraryWatchGamesRequest>,
     ) -> Result<Response<Self::WatchGamesStream>, Status> {
-        // TODO: real implementation needs to resolve each requested
-        // storefront's plugin the same way list_games does, then merge
-        // their individual event streams (if/when Store gains a
-        // streaming RPC of its own — it doesn't yet). Left as a stub
-        // matching the original behavior; not something RegistryClient
-        // alone can solve since it's a Store-side capability gap.
-        let _request = request.into_inner();
-        let stream = tokio_stream::iter(vec![Ok(GameEvent { event: None })]);
-        Ok(Response::new(Box::pin(stream)))
+        let LibraryWatchGamesRequest {
+            profile_id,
+            storefronts,
+        } = request.into_inner();
+
+        let storefronts = storefronts
+            .into_iter()
+            .filter_map(|s| Storefront::try_from(s).ok())
+            .collect::<Vec<_>>();
+
+        let (tx, rx) = mpsc::channel(32);
+
+        for storefront in storefronts {
+            let mut client = match self.store_client_for(storefront).await {
+                Ok(Some(client)) => client,
+                Ok(None) => {
+                    tracing::debug!("no plugin registered for {storefront:?}, skipping watch");
+                    continue;
+                }
+                Err(err) => {
+                    tracing::warn!("failed to reach {storefront:?} plugin: {err}");
+                    continue;
+                }
+            };
+
+            let profile_id = profile_id.clone();
+            let tx = tx.clone();
+            tokio::spawn(async move {
+                let mut stream = match client
+                    .watch_games(StoreWatchGamesRequest { profile_id })
+                    .await
+                {
+                    Ok(response) => response.into_inner(),
+                    Err(err) => {
+                        tracing::warn!("{storefront:?} WatchGames failed: {err}");
+                        return;
+                    }
+                };
+
+                while let Some(item) = stream.next().await {
+                    if tx.send(item).await.is_err() {
+                        return;
+                    }
+                }
+            });
+        }
+
+        Ok(Response::new(Box::pin(ReceiverStream::new(rx))))
     }
 }

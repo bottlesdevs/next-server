@@ -1,12 +1,14 @@
 use next_proto::bottles::{
     common::v1::{LinkedAccount, Storefront},
+    library::v1::GameEvent,
     registry::v1::{ResolvePluginRequest, registry_client::RegistryClient},
     store::v1::{
         BeginLoginRequest, CompleteLoginRequest, ListGamesRequest, ListGamesResponse,
-        LoginChallenge, RefreshSessionRequest, RevokeSessionRequest, store_client::StoreClient,
-        store_server::Store,
+        LoginChallenge, RefreshSessionRequest, RevokeSessionRequest, WatchGamesRequest,
+        store_client::StoreClient, store_server::Store,
     },
 };
+use std::pin::Pin;
 use tokio::sync::Mutex;
 use tonic::{Request, Response, Status, async_trait, transport::Channel};
 
@@ -109,6 +111,20 @@ impl Store for StoreService {
         let _ = request;
         Err(Status::unimplemented(
             "call Library.ListGames for an aggregate view across storefronts",
+        ))
+    }
+
+    type WatchGamesStream = Pin<Box<dyn futures_core::Stream<Item = Result<GameEvent, Status>> + Send + 'static>>;
+
+    async fn watch_games(
+        &self,
+        request: Request<WatchGamesRequest>,
+    ) -> Result<Response<Self::WatchGamesStream>, Status> {
+        // Same reasoning as ListGames above: no storefront field on this
+        // request to route on.
+        let _ = request;
+        Err(Status::unimplemented(
+            "call Library.WatchGames for an aggregate view across storefronts",
         ))
     }
 }
