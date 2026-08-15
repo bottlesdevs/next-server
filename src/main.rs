@@ -1,17 +1,14 @@
-use bottles_core::{
-    credentials::os::OsCredentialStore,
-    plugins::{StorePlugin, egs::EpicGamesService},
-    registry::StoreRegistry,
-};
 use bottles_server::{library::LibraryService, profile::ProfileService, store::StoreService};
 use next_proto::bottles::{
     library::v1::library_server::LibraryServer, profiles::v1::profile_server::ProfileServer,
-    store::v1::store_server::StoreServer,
+    registry::v1::registry_client::RegistryClient, store::v1::store_server::StoreServer,
 };
-use std::sync::Arc;
 use tonic_health::server::health_reporter;
 use tonic_reflection::server::Builder;
 use tracing_subscriber::EnvFilter;
+
+const LISTEN_ADDR: &str = "0.0.0.0:50052";
+const REGISTRY_ENDPOINT: &str = "http://127.0.0.1:50250";
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -23,32 +20,35 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .init();
 
     let (health_reporter, health_service) = health_reporter();
-
     health_reporter
         .set_serving::<ProfileServer<ProfileService>>()
+        .await;
+    health_reporter
+        .set_serving::<LibraryServer<LibraryService>>()
+        .await;
+    health_reporter
+        .set_serving::<StoreServer<StoreService>>()
         .await;
 
     let reflection_service = Builder::configure()
         .register_encoded_file_descriptor_set(next_proto::FILE_DESCRIPTOR_SET)
         .build_v1()?;
 
-    let credentials = Arc::new(OsCredentialStore::new());
+    let library_registry_client = RegistryClient::connect(REGISTRY_ENDPOINT).await?;
+    let library_service = LibraryService::new(library_registry_client);
 
-    let stores = StoreRegistry::new([
-        Arc::new(EpicGamesService::new(credentials.clone())) as Arc<dyn StorePlugin>
-    ]);
+    let store_registry_client = RegistryClient::connect(REGISTRY_ENDPOINT).await?;
+    let store_service = StoreService::new(store_registry_client);
 
-    tracing::info!("Server started on http://127.0.0.1:50052");
+    tracing::info!("Server started on http://{LISTEN_ADDR}");
 
-    let _ = tonic::transport::Server::builder()
+    tonic::transport::Server::builder()
         .add_service(health_service)
         .add_service(reflection_service)
         .add_service(ProfileServer::new(ProfileService::new()))
-        .add_service(StoreServer::new(StoreService::new(Arc::new(
-            stores.clone(),
-        ))))
-        .add_service(LibraryServer::new(LibraryService::new(Arc::new(stores))))
-        .serve("0.0.0.0:50052".parse()?)
+        .add_service(LibraryServer::new(library_service))
+        .add_service(StoreServer::new(store_service))
+        .serve(LISTEN_ADDR.parse()?)
         .await?;
 
     Ok(())
