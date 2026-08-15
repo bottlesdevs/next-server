@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use bottles_core::{registry::StoreRegistry, storefronts::StorePlugin};
+use bottles_core::{plugins::StorePlugin, registry::StoreRegistry};
 use next_proto::bottles::{
     common::v1::{LinkedAccount, Storefront},
     store::v1::{

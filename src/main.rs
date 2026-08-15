@@ -1,7 +1,7 @@
 use bottles_core::{
     credentials::os::OsCredentialStore,
+    plugins::{StorePlugin, egs::EpicGamesService},
     registry::StoreRegistry,
-    storefronts::{StorePlugin, egs::EpicGamesService},
 };
 use bottles_server::{library::LibraryService, profile::ProfileService, store::StoreService};
 use next_proto::bottles::{
