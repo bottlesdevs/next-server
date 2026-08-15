@@ -8,12 +8,15 @@ use next_proto::bottles::{
     profiles::v1::{
         AccountActivationResult, ActivateProfileRequest, ActivateProfileResponse,
         ActivationOutcome, CreateProfileRequest, DeleteProfileRequest, GetActiveProfileResponse,
-        GetProfileRequest, LinkSteamAccountRequest, ListProfilesResponse, ProfileEvent,
-        RenameProfileRequest, SteamLink, SteamSessionEvent, UnlinkAccountRequest,
+        GetProfileRequest, LinkAccountRequest, LinkSteamAccountRequest, ListProfilesResponse,
+        ProfileEvent, RenameProfileRequest, SteamLink, SteamSessionEvent, UnlinkAccountRequest,
         UnlinkSteamAccountRequest, UserProfile, profile_server::Profile,
     },
     registry::v1::{ResolvePluginRequest, registry_client::RegistryClient},
-    store::v1::{RefreshSessionRequest, RevokeSessionRequest, store_client::StoreClient},
+    store::v1::{
+        CompleteLoginRequest, RefreshSessionRequest, RevokeSessionRequest,
+        store_client::StoreClient,
+    },
 };
 use prost_wkt_types::Timestamp;
 use serde::{Deserialize, Serialize};
@@ -360,6 +363,59 @@ impl Profile for ProfileService {
         profile
             .accounts
             .retain(|account| account.storefront != req.storefront);
+        let profile = profile.clone();
+
+        self.persist(&state).await?;
+        Ok(Response::new(profile))
+    }
+
+    /// Completes an interactive login started via Store.BeginLogin and
+    /// attaches the resulting LinkedAccount to the profile. Verifies the
+    /// profile exists up front so a bad profile_id fails fast instead of
+    /// burning the plugin's one-shot login challenge for nothing.
+    async fn link_account(
+        &self,
+        request: Request<LinkAccountRequest>,
+    ) -> Result<Response<UserProfile>, Status> {
+        let req = request.into_inner();
+
+        {
+            let state = self.state.read().await;
+            if !state.profiles.iter().any(|p| p.id == req.profile_id) {
+                return Err(Self::not_found(&req.profile_id));
+            }
+        }
+
+        let storefront = Storefront::try_from(req.storefront)
+            .map_err(|_| Status::invalid_argument("invalid storefront"))?;
+
+        let mut client = self
+            .store_client_for(storefront)
+            .await?
+            .ok_or_else(|| {
+                Status::unavailable(format!("no plugin registered for {storefront:?}"))
+            })?;
+
+        let account = client
+            .complete_login(CompleteLoginRequest {
+                challenge_id: req.challenge_id,
+                profile_id: req.profile_id.clone(),
+                storefront: req.storefront,
+                user_input: req.user_input,
+            })
+            .await?
+            .into_inner();
+
+        let mut state = self.state.write().await;
+        let profile = state
+            .profiles
+            .iter_mut()
+            .find(|profile| profile.id == req.profile_id)
+            .ok_or_else(|| Self::not_found(&req.profile_id))?;
+        profile
+            .accounts
+            .retain(|existing| existing.storefront != req.storefront);
+        profile.accounts.push(account);
         let profile = profile.clone();
 
         self.persist(&state).await?;
