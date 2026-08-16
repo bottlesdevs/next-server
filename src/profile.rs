@@ -31,6 +31,9 @@ fn to_status(err: bottles_core::Error) -> Status {
     match &err {
         bottles_core::Error::Status(status) => status.clone(),
         bottles_core::Error::Profile(ProfileError::NotFound(_)) => Status::not_found(err.to_string()),
+        bottles_core::Error::Profile(ProfileError::SteamAccountAlreadyLinked { .. }) => {
+            Status::already_exists(err.to_string())
+        }
         _ => Status::internal(err.to_string()),
     }
 }
