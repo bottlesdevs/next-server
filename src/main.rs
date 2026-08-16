@@ -1,4 +1,4 @@
-use std::sync::Arc;
+use std::{sync::Arc, time::Duration};
 
 use bottles_core::library::InstallsStore;
 use bottles_server::{
@@ -44,8 +44,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .register_encoded_file_descriptor_set(next_proto::FILE_DESCRIPTOR_SET)
         .build_v1()?;
 
+    // No timeout on reqwest's defaults means a chunk request that gets a
+    // connection but then no further bytes (a stale/expired CDN URL, a
+    // silently dropped response — the exact failure mode game-install
+    // chunk downloads hit in practice) hangs forever instead of erroring,
+    // stalling the whole install with no visible cause. `read_timeout`
+    // bounds idle time between reads rather than total request time, so
+    // a large chunk that's still actively transferring isn't penalized.
+    let reqwest_client = reqwest::Client::builder()
+        .connect_timeout(Duration::from_secs(10))
+        .read_timeout(Duration::from_secs(30))
+        .build()
+        .map_err(|err| format!("failed to build HTTP client: {err}"))?;
     let http_client = Arc::new(
-        http_client::ReqwestClient::new()
+        http_client::ReqwestClient::with_client(reqwest_client)
             .map_err(|err| format!("failed to build HTTP client: {err}"))?,
     );
     let downloads = Arc::new(
@@ -54,22 +66,29 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
     let installs = Arc::new(InstallsStore::load().await?);
 
+    // Owns the addon catalog, downloader, and prefix/storage context every
+    // Bottle handle shares; kept alive for the process's lifetime by this
+    // binding outliving `.serve()` below. Left at its defaults (no FVS
+    // daemon, default catalog URLs) — bottle creation/snapshot RPCs will
+    // fail until those are actually configured for this environment.
+    // Library needs the same BottleManager to install games directly
+    // into a bottle's prefix.
+    let bottles = bottles_core::Bottles::open(bottles_core::Config::default()).await?;
+    let bottle_service = BottleService::new(bottles.bottles().clone());
+
     let library_registry_client = RegistryClient::connect(REGISTRY_ENDPOINT).await?;
-    let library_service = LibraryService::new(library_registry_client, downloads, installs);
+    let library_service = LibraryService::new(
+        library_registry_client,
+        downloads,
+        installs,
+        bottles.bottles().clone(),
+    );
 
     let store_registry_client = RegistryClient::connect(REGISTRY_ENDPOINT).await?;
     let store_service = StoreService::new(store_registry_client);
 
     let profile_registry_client = RegistryClient::connect(REGISTRY_ENDPOINT).await?;
     let profile_service = ProfileService::new(profile_registry_client).await?;
-
-    // Owns the addon catalog, downloader, and prefix/storage context every
-    // Bottle handle shares; kept alive for the process's lifetime by this
-    // binding outliving `.serve()` below. Left at its defaults (no FVS
-    // daemon, default catalog URLs) — bottle creation/snapshot RPCs will
-    // fail until those are actually configured for this environment.
-    let bottles = bottles_core::Bottles::open(bottles_core::Config::default()).await?;
-    let bottle_service = BottleService::new(bottles.bottles().clone());
 
     tracing::info!("Server started on http://{LISTEN_ADDR}");
 
