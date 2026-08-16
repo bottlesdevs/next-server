@@ -1,8 +1,8 @@
 use std::sync::Arc;
 
+use bottles_core::library::InstallsStore;
 use bottles_server::{
-    bottle::BottleService, installs::InstallsStore, library::LibraryService,
-    profile::ProfileService, store::StoreService,
+    bottle::BottleService, library::LibraryService, profile::ProfileService, store::StoreService,
 };
 use download_manager::manager::{DownloadManager, DownloadManagerConfig};
 use next_proto::bottles::{

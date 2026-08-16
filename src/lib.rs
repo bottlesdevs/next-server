@@ -1,5 +1,4 @@
 pub mod bottle;
-pub mod installs;
 pub mod library;
 pub mod profile;
 pub mod steam;

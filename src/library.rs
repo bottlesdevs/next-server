@@ -6,9 +6,8 @@ use next_proto::bottles::{
     common::v1::Storefront,
     library::v1::{
         GameEvent, InstallGameEvent, InstallGameRequest, InstallProgress,
-        ListGamesRequest as LibraryListGamesRequest,
-        ListGamesResponse as LibraryListGamesResponse, WatchGamesRequest as LibraryWatchGamesRequest,
-        install_game_event, library_server::Library,
+        ListGamesRequest as LibraryListGamesRequest, ListGamesResponse as LibraryListGamesResponse,
+        WatchGamesRequest as LibraryWatchGamesRequest, install_game_event, library_server::Library,
     },
     registry::v1::{ResolvePluginRequest, registry_client::RegistryClient},
     store::v1::{
@@ -20,7 +19,7 @@ use tokio::sync::{Mutex, mpsc};
 use tokio_stream::{StreamExt, wrappers::ReceiverStream};
 use tonic::{Request, Response, Status, async_trait, transport::Channel};
 
-use crate::installs::{InstallRecord, InstallsStore, install_dir};
+use bottles_core::library::{InstallRecord, InstallsStore, install_dir};
 
 /// Identifies one in-flight install for `CancelInstall` to find.
 type InstallKey = (String, i32, String);
@@ -367,7 +366,7 @@ impl Library for LibraryService {
                         let _ = tx.send(Ok(event)).await;
                     }
                     Err(err) => {
-                        let _ = tx.send(Err(err)).await;
+                        let _ = tx.send(Err(err.into())).await;
                     }
                 }
             }

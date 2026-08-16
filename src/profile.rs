@@ -1,16 +1,21 @@
-use std::{path::PathBuf, pin::Pin};
+//! `bottles.profiles.v1.Profile` — a thin gRPC facade over
+//! `bottles_core::profile::ProfileManager` for persistence and local
+//! mutation, plus the Registry/Store-plugin dialing that manager
+//! deliberately doesn't own (see its module docs): refreshing linked
+//! accounts, completing interactive logins, and revoking sessions.
 
-use directories::ProjectDirs;
+use std::{collections::HashMap, pin::Pin};
+
+use bottles_core::profile::{ProfileManager, error::ProfileError};
 use futures_core::Stream;
-use next_config::Config;
 use next_proto::bottles::{
-    common::v1::{AuthState, Storefront},
+    common::v1::Storefront,
     profiles::v1::{
         AccountActivationResult, ActivateProfileRequest, ActivateProfileResponse,
         ActivationOutcome, CreateProfileRequest, DeleteProfileRequest, GetActiveProfileResponse,
         GetProfileRequest, LinkAccountRequest, LinkSteamAccountRequest, ListProfilesResponse,
         ProfileEvent, RenameProfileRequest, SteamLink, SteamSessionEvent, UnlinkAccountRequest,
-        UnlinkSteamAccountRequest, UserProfile, profile_event, profile_server::Profile,
+        UnlinkSteamAccountRequest, UserProfile, profile_server::Profile,
     },
     registry::v1::{ResolvePluginRequest, registry_client::RegistryClient},
     store::v1::{
@@ -18,101 +23,30 @@ use next_proto::bottles::{
         store_client::StoreClient,
     },
 };
-use prost_wkt_types::Timestamp;
-use serde::{Deserialize, Serialize};
-use tokio::sync::{Mutex, RwLock, broadcast};
-use tokio_stream::{StreamExt, wrappers::BroadcastStream};
+use tokio::sync::Mutex;
+use tokio_stream::StreamExt;
 use tonic::{Request, Response, Result, Status, async_trait, transport::Channel};
-use uuid::Uuid;
 
-const EVENTS_CAPACITY: usize = 16;
-
-const PROFILES_FILE: &str = "profiles.toml";
-
-#[derive(Debug, Default, Clone, Serialize, Deserialize, Config)]
-#[config(version = 1)]
-struct ProfilesConfig {
-    active_profile_id: Option<String>,
-    profiles: Vec<UserProfile>,
-}
-
-fn profiles_path() -> Result<PathBuf, Status> {
-    ProjectDirs::from("com", "usebottles", "bottles-next")
-        .map(|dirs| dirs.config_dir().join(PROFILES_FILE))
-        .ok_or_else(|| Status::internal("could not resolve the config directory"))
-}
-
-fn now() -> Timestamp {
-    Timestamp::from(std::time::SystemTime::now())
+fn to_status(err: bottles_core::Error) -> Status {
+    match &err {
+        bottles_core::Error::Status(status) => status.clone(),
+        bottles_core::Error::Profile(ProfileError::NotFound(_)) => Status::not_found(err.to_string()),
+        _ => Status::internal(err.to_string()),
+    }
 }
 
 pub struct ProfileService {
-    path: PathBuf,
-    state: RwLock<ProfilesConfig>,
+    manager: ProfileManager,
     registry: Mutex<RegistryClient<Channel>>,
-    events: broadcast::Sender<ProfileEvent>,
 }
 
 impl ProfileService {
     pub async fn new(registry: RegistryClient<Channel>) -> Result<Self, Status> {
-        let path = profiles_path()?;
-
-        let state = match next_config::load::<ProfilesConfig>(&path).await {
-            Ok(state) => state,
-            Err(next_config::error::Error::Io(err))
-                if err.kind() == std::io::ErrorKind::NotFound =>
-            {
-                ProfilesConfig::default()
-            }
-            Err(err) => {
-                return Err(Status::internal(format!(
-                    "failed to load {}: {err}",
-                    path.display()
-                )));
-            }
-        };
-
-        let (events, _) = broadcast::channel(EVENTS_CAPACITY);
-
+        let manager = ProfileManager::load().await.map_err(to_status)?;
         Ok(Self {
-            path,
-            state: RwLock::new(state),
+            manager,
             registry: Mutex::new(registry),
-            events,
         })
-    }
-
-    async fn persist(&self, state: &ProfilesConfig) -> Result<(), Status> {
-        next_config::save(&self.path, state)
-            .await
-            .map_err(|err| Status::internal(format!("failed to save profiles: {err}")))
-    }
-
-    fn not_found(profile_id: &str) -> Status {
-        Status::not_found(format!("no profile with id {profile_id}"))
-    }
-
-    /// Broadcasts a profile event to any active WatchActiveProfile
-    /// subscribers. No-op (aside from the send failing silently) when
-    /// nobody's currently watching.
-    fn emit_updated(&self, profile: &UserProfile) {
-        let _ = self.events.send(ProfileEvent {
-            event: Some(profile_event::Event::Updated(profile.clone())),
-        });
-    }
-
-    fn emit_activated(&self, profile: &UserProfile) {
-        let _ = self.events.send(ProfileEvent {
-            event: Some(profile_event::Event::Activated(profile.clone())),
-        });
-    }
-
-    fn emit_deleted(&self, profile_id: &str) {
-        let _ = self.events.send(ProfileEvent {
-            event: Some(profile_event::Event::DeletedProfileId(
-                profile_id.to_string(),
-            )),
-        });
     }
 
     /// Resolves `storefront` to its owning plugin via the Registry and
@@ -154,9 +88,8 @@ impl Profile for ProfileService {
         &self,
         _request: Request<()>,
     ) -> Result<Response<ListProfilesResponse>, Status> {
-        let state = self.state.read().await;
         Ok(Response::new(ListProfilesResponse {
-            profiles: state.profiles.clone(),
+            profiles: self.manager.list().await,
         }))
     }
 
@@ -165,13 +98,7 @@ impl Profile for ProfileService {
         request: Request<GetProfileRequest>,
     ) -> Result<Response<UserProfile>, Status> {
         let profile_id = request.into_inner().profile_id;
-        let state = self.state.read().await;
-        let profile = state
-            .profiles
-            .iter()
-            .find(|profile| profile.id == profile_id)
-            .cloned()
-            .ok_or_else(|| Self::not_found(&profile_id))?;
+        let profile = self.manager.get(&profile_id).await.map_err(to_status)?;
         Ok(Response::new(profile))
     }
 
@@ -180,22 +107,11 @@ impl Profile for ProfileService {
         request: Request<CreateProfileRequest>,
     ) -> Result<Response<UserProfile>, Status> {
         let req = request.into_inner();
-        let mut state = self.state.write().await;
-
-        let profile = UserProfile {
-            id: Uuid::new_v4().to_string(),
-            name: req.name,
-            icon: req.icon,
-            accounts: Vec::new(),
-            steam_link: None,
-            created_at: Some(now()),
-            last_activated_at: None,
-        };
-
-        state.profiles.push(profile.clone());
-        self.persist(&state).await?;
-        self.emit_updated(&profile);
-
+        let profile = self
+            .manager
+            .create(req.name, req.icon)
+            .await
+            .map_err(to_status)?;
         Ok(Response::new(profile))
     }
 
@@ -204,20 +120,7 @@ impl Profile for ProfileService {
         request: Request<DeleteProfileRequest>,
     ) -> Result<Response<()>, Status> {
         let profile_id = request.into_inner().profile_id;
-        let mut state = self.state.write().await;
-
-        let len_before = state.profiles.len();
-        state.profiles.retain(|profile| profile.id != profile_id);
-        if state.profiles.len() == len_before {
-            return Err(Self::not_found(&profile_id));
-        }
-
-        if state.active_profile_id.as_deref() == Some(profile_id.as_str()) {
-            state.active_profile_id = None;
-        }
-
-        self.persist(&state).await?;
-        self.emit_deleted(&profile_id);
+        self.manager.delete(&profile_id).await.map_err(to_status)?;
         Ok(Response::new(()))
     }
 
@@ -226,18 +129,11 @@ impl Profile for ProfileService {
         request: Request<RenameProfileRequest>,
     ) -> Result<Response<UserProfile>, Status> {
         let req = request.into_inner();
-        let mut state = self.state.write().await;
-
-        let profile = state
-            .profiles
-            .iter_mut()
-            .find(|profile| profile.id == req.profile_id)
-            .ok_or_else(|| Self::not_found(&req.profile_id))?;
-        profile.name = req.name;
-        let profile = profile.clone();
-
-        self.persist(&state).await?;
-        self.emit_updated(&profile);
+        let profile = self
+            .manager
+            .rename(&req.profile_id, req.name)
+            .await
+            .map_err(to_status)?;
         Ok(Response::new(profile))
     }
 
@@ -245,15 +141,9 @@ impl Profile for ProfileService {
         &self,
         _request: Request<()>,
     ) -> Result<Response<GetActiveProfileResponse>, Status> {
-        let state = self.state.read().await;
-        let profile = state.active_profile_id.as_deref().and_then(|id| {
-            state
-                .profiles
-                .iter()
-                .find(|profile| profile.id == id)
-                .cloned()
-        });
-        Ok(Response::new(GetActiveProfileResponse { profile }))
+        Ok(Response::new(GetActiveProfileResponse {
+            profile: self.manager.active().await,
+        }))
     }
 
     /// Activates a profile: for every linked account, verifies/refreshes its
@@ -267,27 +157,18 @@ impl Profile for ProfileService {
     ) -> Result<Response<ActivateProfileResponse>, Status> {
         let req = request.into_inner();
 
-        let accounts = {
-            let state = self.state.read().await;
-            let profile = state
-                .profiles
-                .iter()
-                .find(|profile| profile.id == req.profile_id)
-                .ok_or_else(|| Self::not_found(&req.profile_id))?;
-            profile.accounts.clone()
-        };
-
-        let targets = accounts.into_iter().filter(|account| {
-            req.only.is_empty() || req.only.contains(&account.storefront)
-        });
+        let accounts = self
+            .manager
+            .accounts_for_activation(&req.profile_id, &req.only)
+            .await
+            .map_err(to_status)?;
 
         let mut results = Vec::new();
         // Ok(account) replaces the stored LinkedAccount with the refreshed
         // one; Err marks it stale in place without touching other fields.
-        let mut updates: std::collections::HashMap<i32, std::result::Result<_, ()>> =
-            std::collections::HashMap::new();
+        let mut updates: HashMap<i32, std::result::Result<_, ()>> = HashMap::new();
 
-        for account in targets {
+        for account in accounts {
             let Ok(storefront) = Storefront::try_from(account.storefront) else {
                 continue;
             };
@@ -334,26 +215,11 @@ impl Profile for ProfileService {
             results.push(outcome);
         }
 
-        let mut state = self.state.write().await;
-        let profile = state
-            .profiles
-            .iter_mut()
-            .find(|profile| profile.id == req.profile_id)
-            .ok_or_else(|| Self::not_found(&req.profile_id))?;
-
-        for account in &mut profile.accounts {
-            match updates.remove(&account.storefront) {
-                Some(Ok(refreshed)) => *account = refreshed,
-                Some(Err(())) => account.auth_state = AuthState::Stale as i32,
-                None => {}
-            }
-        }
-        profile.last_activated_at = Some(now());
-        let profile = profile.clone();
-
-        state.active_profile_id = Some(req.profile_id);
-        self.persist(&state).await?;
-        self.emit_activated(&profile);
+        let profile = self
+            .manager
+            .apply_activation(&req.profile_id, updates)
+            .await
+            .map_err(to_status)?;
 
         Ok(Response::new(ActivateProfileResponse {
             profile: Some(profile),
@@ -388,19 +254,11 @@ impl Profile for ProfileService {
             }
         }
 
-        let mut state = self.state.write().await;
-        let profile = state
-            .profiles
-            .iter_mut()
-            .find(|profile| profile.id == req.profile_id)
-            .ok_or_else(|| Self::not_found(&req.profile_id))?;
-        profile
-            .accounts
-            .retain(|account| account.storefront != req.storefront);
-        let profile = profile.clone();
-
-        self.persist(&state).await?;
-        self.emit_updated(&profile);
+        let profile = self
+            .manager
+            .unlink_account(&req.profile_id, req.storefront)
+            .await
+            .map_err(to_status)?;
         Ok(Response::new(profile))
     }
 
@@ -414,12 +272,10 @@ impl Profile for ProfileService {
     ) -> Result<Response<UserProfile>, Status> {
         let req = request.into_inner();
 
-        {
-            let state = self.state.read().await;
-            if !state.profiles.iter().any(|p| p.id == req.profile_id) {
-                return Err(Self::not_found(&req.profile_id));
-            }
-        }
+        self.manager
+            .ensure_exists(&req.profile_id)
+            .await
+            .map_err(to_status)?;
 
         let storefront = Storefront::try_from(req.storefront)
             .map_err(|_| Status::invalid_argument("invalid storefront"))?;
@@ -441,20 +297,11 @@ impl Profile for ProfileService {
             .await?
             .into_inner();
 
-        let mut state = self.state.write().await;
-        let profile = state
-            .profiles
-            .iter_mut()
-            .find(|profile| profile.id == req.profile_id)
-            .ok_or_else(|| Self::not_found(&req.profile_id))?;
-        profile
-            .accounts
-            .retain(|existing| existing.storefront != req.storefront);
-        profile.accounts.push(account);
-        let profile = profile.clone();
-
-        self.persist(&state).await?;
-        self.emit_updated(&profile);
+        let profile = self
+            .manager
+            .link_account(&req.profile_id, account)
+            .await
+            .map_err(to_status)?;
         Ok(Response::new(profile))
     }
 
@@ -478,19 +325,16 @@ impl Profile for ProfileService {
                 .unwrap_or_default()
         };
 
-        {
-            let mut state = self.state.write().await;
-            let profile = state
-                .profiles
-                .iter_mut()
-                .find(|profile| profile.id == req.profile_id)
-                .ok_or_else(|| Self::not_found(&req.profile_id))?;
-            profile.steam_link = Some(SteamLink {
-                steam_id64: req.steam_id64.clone(),
-                account_name,
-            });
-            self.persist(&state).await?;
-        }
+        self.manager
+            .link_steam(
+                &req.profile_id,
+                SteamLink {
+                    steam_id64: req.steam_id64.clone(),
+                    account_name,
+                },
+            )
+            .await
+            .map_err(to_status)?;
 
         if req.auto_activate {
             let activated = self
@@ -506,15 +350,11 @@ impl Profile for ProfileService {
             return Ok(Response::new(profile));
         }
 
-        let state = self.state.read().await;
-        let profile = state
-            .profiles
-            .iter()
-            .find(|profile| profile.id == req.profile_id)
-            .cloned()
-            .ok_or_else(|| Self::not_found(&req.profile_id))?;
-        drop(state);
-        self.emit_updated(&profile);
+        let profile = self
+            .manager
+            .get(&req.profile_id)
+            .await
+            .map_err(to_status)?;
         Ok(Response::new(profile))
     }
 
@@ -523,55 +363,23 @@ impl Profile for ProfileService {
         request: Request<UnlinkSteamAccountRequest>,
     ) -> Result<Response<UserProfile>, Status> {
         let profile_id = request.into_inner().profile_id;
-        let mut state = self.state.write().await;
-
-        let profile = state
-            .profiles
-            .iter_mut()
-            .find(|profile| profile.id == profile_id)
-            .ok_or_else(|| Self::not_found(&profile_id))?;
-        profile.steam_link = None;
-        let profile = profile.clone();
-
-        self.persist(&state).await?;
-        self.emit_updated(&profile);
+        let profile = self
+            .manager
+            .unlink_steam(&profile_id)
+            .await
+            .map_err(to_status)?;
         Ok(Response::new(profile))
     }
 
     type WatchActiveProfileStream =
         Pin<Box<dyn Stream<Item = Result<ProfileEvent, Status>> + Send + 'static>>;
 
-    /// Server-streaming: UI subscribes instead of polling. Emits the
-    /// current active profile (if any) as an initial Activated event, then
-    /// forwards every subsequent mutation broadcast by the RPCs above.
+    /// Server-streaming: UI subscribes instead of polling.
     async fn watch_active_profile(
         &self,
         _request: Request<()>,
     ) -> Result<Response<Self::WatchActiveProfileStream>, Status> {
-        // Subscribe before reading state so no event can land in the gap
-        // between snapshotting "current" and starting to listen for "next".
-        let receiver = self.events.subscribe();
-
-        let initial = {
-            let state = self.state.read().await;
-            state.active_profile_id.as_deref().and_then(|id| {
-                state
-                    .profiles
-                    .iter()
-                    .find(|profile| profile.id == id)
-                    .cloned()
-            })
-        }
-        .map(|profile| ProfileEvent {
-            event: Some(profile_event::Event::Activated(profile)),
-        });
-
-        // A lagged receiver just means this subscriber missed some events
-        // under backpressure — skip the gap rather than erroring the whole
-        // stream out from under the caller.
-        let live = BroadcastStream::new(receiver).filter_map(|item| item.ok());
-
-        let stream = tokio_stream::iter(initial).chain(live).map(Ok);
+        let stream = self.manager.watch().map(Ok);
         Ok(Response::new(Box::pin(stream)))
     }
 
@@ -579,10 +387,7 @@ impl Profile for ProfileService {
         Pin<Box<dyn Stream<Item = Result<SteamSessionEvent, Status>> + Send + 'static>>;
 
     /// Server-streaming: fires when Bottles detects the OS-level Steam
-    /// active user has changed (via filesystem watch on loginusers.vdf /
-    /// registry.vdf). Consumers that want auto-switch behavior listen here
-    /// and call ActivateProfile themselves, or rely on next-core's own
-    /// internal watcher doing so if auto-activation is enabled on the link.
+    /// active user has changed (via filesystem watch on loginusers.vdf).
     async fn watch_steam_sessions(
         &self,
         _request: Request<()>,
