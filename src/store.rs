@@ -3,9 +3,9 @@ use next_proto::bottles::{
     library::v1::GameEvent,
     registry::v1::{ResolvePluginRequest, registry_client::RegistryClient},
     store::v1::{
-        BeginLoginRequest, CompleteLoginRequest, ListGamesRequest, ListGamesResponse,
-        LoginChallenge, RefreshSessionRequest, RevokeSessionRequest, WatchGamesRequest,
-        store_client::StoreClient, store_server::Store,
+        BeginLoginRequest, CompleteLoginRequest, GetInstallManifestRequest, InstallManifest,
+        ListGamesRequest, ListGamesResponse, LoginChallenge, RefreshSessionRequest,
+        RevokeSessionRequest, WatchGamesRequest, store_client::StoreClient, store_server::Store,
     },
 };
 use std::pin::Pin;
@@ -125,6 +125,20 @@ impl Store for StoreService {
         let _ = request;
         Err(Status::unimplemented(
             "call Library.WatchGames for an aggregate view across storefronts",
+        ))
+    }
+
+    async fn get_install_manifest(
+        &self,
+        request: Request<GetInstallManifestRequest>,
+    ) -> Result<Response<InstallManifest>, Status> {
+        // Same reasoning as ListGames/WatchGames above: no storefront
+        // field on this request to route on. Library.InstallGame calls
+        // Store.GetInstallManifest directly on the resolved plugin, since
+        // it has a storefront from its own request.
+        let _ = request;
+        Err(Status::unimplemented(
+            "call Library.InstallGame, which resolves the owning plugin itself",
         ))
     }
 }

@@ -1,22 +1,29 @@
-use std::pin::Pin;
+use std::{collections::HashMap, pin::Pin, sync::Arc};
 
+use download_manager::{download::Download, manager::DownloadManager};
 use futures_core::Stream;
 use next_proto::bottles::{
     common::v1::Storefront,
     library::v1::{
-        GameEvent, ListGamesRequest as LibraryListGamesRequest,
+        GameEvent, InstallGameEvent, InstallGameRequest, InstallProgress,
+        ListGamesRequest as LibraryListGamesRequest,
         ListGamesResponse as LibraryListGamesResponse, WatchGamesRequest as LibraryWatchGamesRequest,
-        library_server::Library,
+        install_game_event, library_server::Library,
     },
     registry::v1::{ResolvePluginRequest, registry_client::RegistryClient},
     store::v1::{
-        ListGamesRequest as StoreListGamesRequest, WatchGamesRequest as StoreWatchGamesRequest,
-        store_client::StoreClient,
+        GetInstallManifestRequest, ListGamesRequest as StoreListGamesRequest,
+        WatchGamesRequest as StoreWatchGamesRequest, store_client::StoreClient,
     },
 };
 use tokio::sync::{Mutex, mpsc};
 use tokio_stream::{StreamExt, wrappers::ReceiverStream};
 use tonic::{Request, Response, Status, async_trait, transport::Channel};
+
+use crate::installs::{InstallRecord, InstallsStore, install_dir};
+
+/// Identifies one in-flight install for `CancelInstall` to find.
+type InstallKey = (String, i32, String);
 
 /// Aggregates game libraries across storefronts by resolving each
 /// storefront's owning plugin through the Registry, then calling
@@ -24,12 +31,27 @@ use tonic::{Request, Response, Status, async_trait, transport::Channel};
 /// objects are held here — everything is a fresh RPC per call.
 pub struct LibraryService {
     registry: Mutex<RegistryClient<Channel>>,
+    downloads: Arc<DownloadManager>,
+    installs: Arc<InstallsStore>,
+    /// Downloads belonging to an in-progress InstallGame, so CancelInstall
+    /// can find and cancel them. Entries are removed once the install
+    /// finishes, fails, or is cancelled. `Arc`-wrapped so the spawned
+    /// completion task in `install_game` can remove its own entry
+    /// without needing `self` to outlive it.
+    active_installs: Arc<Mutex<HashMap<InstallKey, Vec<Download>>>>,
 }
 
 impl LibraryService {
-    pub fn new(registry: RegistryClient<Channel>) -> Self {
+    pub fn new(
+        registry: RegistryClient<Channel>,
+        downloads: Arc<DownloadManager>,
+        installs: Arc<InstallsStore>,
+    ) -> Self {
         Self {
             registry: Mutex::new(registry),
+            downloads,
+            installs,
+            active_installs: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -115,6 +137,15 @@ impl Library for LibraryService {
             }
         }
 
+        for game in &mut games {
+            let Ok(storefront) = Storefront::try_from(game.storefront) else {
+                continue;
+            };
+            if let Some(record) = self.installs.get(&profile_id, storefront, &game.id).await {
+                game.install_state = Some(record.install_state());
+            }
+        }
+
         Ok(Response::new(LibraryListGamesResponse { games }))
     }
 
@@ -178,5 +209,214 @@ impl Library for LibraryService {
         }
 
         Ok(Response::new(Box::pin(ReceiverStream::new(rx))))
+    }
+
+    type InstallGameStream =
+        Pin<Box<dyn Stream<Item = Result<InstallGameEvent, Status>> + Send + 'static>>;
+
+    /// Resolves the owning plugin's install manifest, downloads every
+    /// file into `installs::install_dir`, and persists an `InstallRecord`
+    /// on success. Progress from every file's download is forwarded as
+    /// it happens; the stream ends with one `done` event.
+    ///
+    /// Doesn't yet install into a Bottle (see bottles.bottle.v1, not
+    /// implemented) — files land in a Library-managed directory instead,
+    /// and the resulting `InstallState.bottle_id` stays unset.
+    async fn install_game(
+        &self,
+        request: Request<InstallGameRequest>,
+    ) -> Result<Response<Self::InstallGameStream>, Status> {
+        let InstallGameRequest {
+            profile_id,
+            storefront,
+            game_id,
+        } = request.into_inner();
+        let storefront_enum = Storefront::try_from(storefront)
+            .map_err(|_| Status::invalid_argument("invalid storefront"))?;
+
+        let mut client = self
+            .store_client_for(storefront_enum)
+            .await?
+            .ok_or_else(|| {
+                Status::unavailable(format!("no plugin registered for {storefront_enum:?}"))
+            })?;
+
+        let manifest = client
+            .get_install_manifest(GetInstallManifestRequest {
+                profile_id: profile_id.clone(),
+                game_id: game_id.clone(),
+            })
+            .await?
+            .into_inner();
+
+        let dir = install_dir(&profile_id, storefront_enum, &game_id)?;
+        let downloads = self.downloads.clone();
+        let installs = self.installs.clone();
+        let key: InstallKey = (profile_id.clone(), storefront, game_id.clone());
+
+        let (tx, rx) = mpsc::channel(32);
+        let mut handles = Vec::with_capacity(manifest.files.len());
+        let mut in_flight = Vec::with_capacity(manifest.files.len());
+
+        for file in &manifest.files {
+            let url = match url::Url::parse(&file.download_url) {
+                Ok(url) => url,
+                Err(err) => {
+                    let _ = tx
+                        .send(Err(Status::internal(format!(
+                            "bad download URL for {}: {err}",
+                            file.relative_path
+                        ))))
+                        .await;
+                    return Ok(Response::new(Box::pin(ReceiverStream::new(rx))));
+                }
+            };
+            let destination = dir.join(&file.relative_path);
+            if let Some(parent) = destination.parent()
+                && let Err(err) = tokio::fs::create_dir_all(parent).await
+            {
+                let _ = tx.send(Err(Status::internal(err.to_string()))).await;
+                return Ok(Response::new(Box::pin(ReceiverStream::new(rx))));
+            }
+
+            let download = match downloads.download(url, destination) {
+                Ok(download) => download,
+                Err(err) => {
+                    let _ = tx
+                        .send(Err(Status::internal(format!(
+                            "failed to enqueue {}: {err}",
+                            file.relative_path
+                        ))))
+                        .await;
+                    return Ok(Response::new(Box::pin(ReceiverStream::new(rx))));
+                }
+            };
+            handles.push(download.clone());
+
+            let relative_path = file.relative_path.clone();
+            let progress_tx = tx.clone();
+            let progress_download = download.clone();
+            tokio::spawn(async move {
+                let stream = progress_download.progress();
+                tokio::pin!(stream);
+                while let Some(progress) = stream.next().await {
+                    let event = InstallGameEvent {
+                        event: Some(install_game_event::Event::Progress(InstallProgress {
+                            current_file: relative_path.clone(),
+                            bytes_downloaded: progress.bytes_downloaded(),
+                            total_bytes: progress.total_bytes(),
+                            bytes_per_second: progress.bytes_per_second(),
+                        })),
+                    };
+                    if progress_tx.send(Ok(event)).await.is_err() {
+                        return;
+                    }
+                }
+            });
+
+            in_flight.push((file.relative_path.clone(), download));
+        }
+
+        self.active_installs
+            .lock()
+            .await
+            .insert(key.clone(), handles);
+        let active_installs = self.active_installs.clone();
+
+        tokio::spawn(async move {
+            let mut relative_paths = Vec::with_capacity(in_flight.len());
+            let mut install_size_bytes = Some(0u64);
+            let mut failed = false;
+
+            for (relative_path, download) in in_flight {
+                match download.await {
+                    Ok(result) => {
+                        relative_paths.push(relative_path);
+                        install_size_bytes = install_size_bytes
+                            .zip(Some(result.bytes_downloaded))
+                            .map(|(a, b)| a + b);
+                    }
+                    Err(err) => {
+                        let _ = tx.send(Err(Status::internal(err.to_string()))).await;
+                        failed = true;
+                        break;
+                    }
+                }
+            }
+
+            // The install is no longer cancellable once every file has
+            // settled (succeeded, failed, or was already cancelled by
+            // CancelInstall, which removes this entry itself).
+            active_installs.lock().await.remove(&key);
+
+            if !failed {
+                let record = InstallRecord {
+                    profile_id,
+                    storefront,
+                    game_id,
+                    version: manifest.version,
+                    install_size_bytes: manifest.install_size_bytes.or(install_size_bytes),
+                    relative_paths,
+                };
+                let install_state = record.install_state();
+                match installs.upsert(record).await {
+                    Ok(()) => {
+                        let event = InstallGameEvent {
+                            event: Some(install_game_event::Event::Done(install_state)),
+                        };
+                        let _ = tx.send(Ok(event)).await;
+                    }
+                    Err(err) => {
+                        let _ = tx.send(Err(err)).await;
+                    }
+                }
+            }
+        });
+
+        Ok(Response::new(Box::pin(ReceiverStream::new(rx))))
+    }
+
+    async fn cancel_install(
+        &self,
+        request: Request<InstallGameRequest>,
+    ) -> Result<Response<()>, Status> {
+        let InstallGameRequest {
+            profile_id,
+            storefront,
+            game_id,
+        } = request.into_inner();
+        let key: InstallKey = (profile_id, storefront, game_id);
+
+        if let Some(downloads) = self.active_installs.lock().await.remove(&key) {
+            for download in downloads {
+                let _ = download.cancel().await;
+            }
+        }
+
+        Ok(Response::new(()))
+    }
+
+    async fn uninstall_game(
+        &self,
+        request: Request<InstallGameRequest>,
+    ) -> Result<Response<()>, Status> {
+        let InstallGameRequest {
+            profile_id,
+            storefront,
+            game_id,
+        } = request.into_inner();
+        let storefront_enum = Storefront::try_from(storefront)
+            .map_err(|_| Status::invalid_argument("invalid storefront"))?;
+
+        let removed = self
+            .installs
+            .remove(&profile_id, storefront_enum, &game_id)
+            .await?;
+        if removed.is_some() {
+            let dir = install_dir(&profile_id, storefront_enum, &game_id)?;
+            let _ = tokio::fs::remove_dir_all(dir).await;
+        }
+
+        Ok(Response::new(()))
     }
 }

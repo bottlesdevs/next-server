@@ -32,3 +32,6 @@ uuid.workspace = true
 prost-wkt-types = "0.7.1"
 keyvalues-parser.workspace = true
 notify.workspace = true
+download-manager.workspace = true
+http-client = { workspace = true, features = ["reqwest"] }
+url.workspace = true
