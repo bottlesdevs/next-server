@@ -3,7 +3,7 @@ use std::{collections::HashMap, pin::Pin, sync::Arc};
 use download_manager::{download::Download, manager::DownloadManager};
 use futures_core::Stream;
 use next_proto::bottles::{
-    common::v1::Storefront,
+    common::v1::{AuthState, Storefront},
     library::v1::{
         GameEvent, InstallGameEvent, InstallGameRequest, InstallProgress,
         ListGamesRequest as LibraryListGamesRequest, ListGamesResponse as LibraryListGamesResponse,
@@ -22,6 +22,7 @@ use tonic::{Request, Response, Status, async_trait, transport::Channel};
 use bottles_core::{
     BottleManager,
     library::{InstallRecord, InstallsStore, install_dir},
+    profile::ProfileManager,
 };
 use uuid::Uuid;
 
@@ -37,11 +38,7 @@ pub struct LibraryService {
     downloads: Arc<DownloadManager>,
     installs: Arc<InstallsStore>,
     bottles: BottleManager,
-    /// Downloads belonging to an in-progress InstallGame, so CancelInstall
-    /// can find and cancel them. Entries are removed once the install
-    /// finishes, fails, or is cancelled. `Arc`-wrapped so the spawned
-    /// completion task in `install_game` can remove its own entry
-    /// without needing `self` to outlive it.
+    profile: ProfileManager,
     active_installs: Arc<Mutex<HashMap<InstallKey, Vec<Download>>>>,
 }
 
@@ -50,12 +47,14 @@ impl LibraryService {
         registry: RegistryClient<Channel>,
         downloads: Arc<DownloadManager>,
         installs: Arc<InstallsStore>,
+        profile: ProfileManager,
         bottles: BottleManager,
     ) -> Self {
         Self {
             registry: Mutex::new(registry),
             downloads,
             installs,
+            profile,
             bottles,
             active_installs: Arc::new(Mutex::new(HashMap::new())),
         }
@@ -102,14 +101,16 @@ impl Library for LibraryService {
         &self,
         request: Request<LibraryListGamesRequest>,
     ) -> Result<Response<LibraryListGamesResponse>, Status> {
-        let LibraryListGamesRequest {
-            profile_id,
-            storefronts,
-        } = request.into_inner();
+        let LibraryListGamesRequest { profile_id } = request.into_inner();
 
-        let storefronts = storefronts
+        let storefronts = self
+            .profile
+            .get(&profile_id)
+            .await?
+            .accounts
             .into_iter()
-            .filter_map(|s| Storefront::try_from(s).ok())
+            .filter(|a| a.auth_state == AuthState::Active as i32)
+            .map(|a| a.storefront())
             .collect::<Vec<_>>();
 
         let mut games = Vec::new();
@@ -167,14 +168,16 @@ impl Library for LibraryService {
         &self,
         request: Request<LibraryWatchGamesRequest>,
     ) -> Result<Response<Self::WatchGamesStream>, Status> {
-        let LibraryWatchGamesRequest {
-            profile_id,
-            storefronts,
-        } = request.into_inner();
+        let LibraryWatchGamesRequest { profile_id } = request.into_inner();
 
-        let storefronts = storefronts
+        let storefronts = self
+            .profile
+            .get(&profile_id)
+            .await?
+            .accounts
             .into_iter()
-            .filter_map(|s| Storefront::try_from(s).ok())
+            .filter(|a| a.auth_state == AuthState::Active as i32)
+            .map(|a| a.storefront())
             .collect::<Vec<_>>();
 
         let (tx, rx) = mpsc::channel(32);
@@ -238,8 +241,8 @@ impl Library for LibraryService {
         } = request.into_inner();
         let storefront_enum = Storefront::try_from(storefront)
             .map_err(|_| Status::invalid_argument("invalid storefront"))?;
-        let bottle_uuid =
-            Uuid::parse_str(&bottle_id).map_err(|_| Status::invalid_argument("invalid bottle_id"))?;
+        let bottle_uuid = Uuid::parse_str(&bottle_id)
+            .map_err(|_| Status::invalid_argument("invalid bottle_id"))?;
         // Fails fast on an unknown bottle rather than downloading first.
         let bottle = self.bottles.open(bottle_uuid).await?;
         let c_drive = bottle.c_drive_path();
@@ -382,9 +385,7 @@ impl Library for LibraryService {
             {
                 for (download, url) in chunk_downloads.iter().zip(&chunk_urls) {
                     if let Err(err) = download.clone().await {
-                        tracing::warn!(
-                            "chunk download failed for {relative_path} ({url}): {err}"
-                        );
+                        tracing::warn!("chunk download failed for {relative_path} ({url}): {err}");
                         let _ = tx
                             .send(Err(Status::internal(format!(
                                 "{relative_path} ({url}): {err}"
@@ -404,8 +405,7 @@ impl Library for LibraryService {
                         // callers never need to know `install_root`
                         // separately.
                         relative_paths.push(format!("{install_root}/{relative_path}"));
-                        install_size_bytes =
-                            install_size_bytes.zip(Some(size)).map(|(a, b)| a + b);
+                        install_size_bytes = install_size_bytes.zip(Some(size)).map(|(a, b)| a + b);
                     }
                     Err(err) => {
                         let _ = tx.send(Err(Status::internal(err.to_string()))).await;
@@ -590,14 +590,15 @@ fn find_goggame_primary_executable(
 
     let contents = std::fs::read(c_drive.join(info_path)).ok()?;
     let info: serde_json::Value = serde_json::from_slice(&contents).ok()?;
-    let primary_task = info
-        .get("playTasks")?
-        .as_array()?
-        .iter()
-        .find(|task| task.get("isPrimary").and_then(serde_json::Value::as_bool) == Some(true))?;
+    let primary_task =
+        info.get("playTasks")?.as_array()?.iter().find(|task| {
+            task.get("isPrimary").and_then(serde_json::Value::as_bool) == Some(true)
+        })?;
     let executable = primary_task.get("path")?.as_str()?;
 
-    let root = std::path::Path::new(info_path).parent().unwrap_or_else(|| std::path::Path::new(""));
+    let root = std::path::Path::new(info_path)
+        .parent()
+        .unwrap_or_else(|| std::path::Path::new(""));
     Some(
         root.join(executable.replace('\\', "/"))
             .to_string_lossy()
@@ -645,9 +646,17 @@ fn find_primary_executable_heuristic(
 
     fn looks_like_helper(name: &str) -> bool {
         let name = name.to_ascii_lowercase();
-        ["crashhandler", "crashpad", "unins", "redist", "vcredist", "setup", "helper"]
-            .iter()
-            .any(|pattern| name.contains(pattern))
+        [
+            "crashhandler",
+            "crashpad",
+            "unins",
+            "redist",
+            "vcredist",
+            "setup",
+            "helper",
+        ]
+        .iter()
+        .any(|pattern| name.contains(pattern))
     }
 
     let non_helpers: Vec<&&str> = candidates

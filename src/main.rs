@@ -1,6 +1,6 @@
 use std::{sync::Arc, time::Duration};
 
-use bottles_core::library::InstallsStore;
+use bottles_core::{library::InstallsStore, profile::ProfileManager};
 use bottles_server::{
     bottle::BottleService, library::LibraryService, profile::ProfileService, store::StoreService,
 };
@@ -66,21 +66,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
     let installs = Arc::new(InstallsStore::load().await?);
 
-    // Owns the addon catalog, downloader, and prefix/storage context every
-    // Bottle handle shares; kept alive for the process's lifetime by this
-    // binding outliving `.serve()` below. Left at its defaults (no FVS
-    // daemon, default catalog URLs) — bottle creation/snapshot RPCs will
-    // fail until those are actually configured for this environment.
-    // Library needs the same BottleManager to install games directly
-    // into a bottle's prefix.
     let bottles = bottles_core::Bottles::open(bottles_core::Config::default()).await?;
     let bottle_service = BottleService::new(bottles.bottles().clone());
 
     let library_registry_client = RegistryClient::connect(REGISTRY_ENDPOINT).await?;
+    let profile = ProfileManager::load().await?;
     let library_service = LibraryService::new(
         library_registry_client,
         downloads,
         installs,
+        profile,
         bottles.bottles().clone(),
     );
 
