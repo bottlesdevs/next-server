@@ -9,11 +9,11 @@ use next_proto::bottles::{
         ListGamesRequest as LibraryListGamesRequest, ListGamesResponse as LibraryListGamesResponse,
         WatchGamesRequest as LibraryWatchGamesRequest, install_game_event, library_server::Library,
     },
-    registry::v1::{ResolvePluginRequest, registry_client::RegistryClient},
-    store::v1::{
+    plugin::v1::{
         GetInstallManifestRequest, ListGamesRequest as StoreListGamesRequest,
-        WatchGamesRequest as StoreWatchGamesRequest, store_client::StoreClient,
+        WatchGamesRequest as StoreWatchGamesRequest, plugin_client::PluginClient,
     },
+    registry::v1::{ResolvePluginRequest, registry_client::RegistryClient},
 };
 use tokio::sync::{Mutex, mpsc};
 use tokio_stream::{StreamExt, wrappers::ReceiverStream};
@@ -68,7 +68,7 @@ impl LibraryService {
     async fn store_client_for(
         &self,
         storefront: Storefront,
-    ) -> Result<Option<StoreClient<Channel>>, Status> {
+    ) -> Result<Option<PluginClient<Channel>>, Status> {
         let resolved = {
             let mut registry = self.registry.lock().await;
             registry
@@ -83,7 +83,7 @@ impl LibraryService {
             return Ok(None);
         };
 
-        let client = StoreClient::connect(endpoint.clone())
+        let client = PluginClient::connect(endpoint.clone())
             .await
             .map_err(|err| {
                 Status::unavailable(format!(

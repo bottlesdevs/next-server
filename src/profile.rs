@@ -1,8 +1,8 @@
 //! `bottles.profiles.v1.Profile` — a thin gRPC facade over
 //! `bottles_core::profile::ProfileManager` for persistence and local
-//! mutation, plus the Registry/Store-plugin dialing that manager
+//! mutation, plus the Registry/Plugin dialing that manager
 //! deliberately doesn't own (see its module docs): refreshing linked
-//! accounts, completing interactive logins, and revoking sessions.
+//! accounts and revoking sessions.
 
 use std::{collections::HashMap, pin::Pin};
 
@@ -10,18 +10,14 @@ use bottles_core::profile::{ProfileManager, error::ProfileError};
 use futures_core::Stream;
 use next_proto::bottles::{
     common::v1::Storefront,
+    plugin::v1::{RefreshSessionRequest, plugin_client::PluginClient},
     profiles::v1::{
         AccountActivationResult, ActivateProfileRequest, ActivateProfileResponse,
         ActivationOutcome, CreateProfileRequest, DeleteProfileRequest, GetActiveProfileResponse,
-        GetProfileRequest, LinkAccountRequest, LinkSteamAccountRequest, ListProfilesResponse,
-        ProfileEvent, RenameProfileRequest, SteamLink, SteamSessionEvent, UnlinkAccountRequest,
-        UnlinkSteamAccountRequest, UserProfile, profile_server::Profile,
+        GetProfileRequest, ListProfilesResponse, ProfileEvent, RenameProfileRequest, UserProfile,
+        profile_server::Profile,
     },
     registry::v1::{ResolvePluginRequest, registry_client::RegistryClient},
-    store::v1::{
-        CompleteLoginRequest, RefreshSessionRequest, RevokeSessionRequest,
-        store_client::StoreClient,
-    },
 };
 use tokio::sync::Mutex;
 use tokio_stream::StreamExt;
@@ -44,21 +40,20 @@ pub struct ProfileService {
 }
 
 impl ProfileService {
-    pub async fn new(registry: RegistryClient<Channel>) -> Result<Self, Status> {
-        let manager = ProfileManager::load().await.map_err(to_status)?;
-        Ok(Self {
+    pub fn new(manager: ProfileManager, registry: RegistryClient<Channel>) -> Self {
+        Self {
             manager,
             registry: Mutex::new(registry),
-        })
+        }
     }
 
     /// Resolves `storefront` to its owning plugin via the Registry and
-    /// dials a fresh Store client — same pattern as StoreService, kept
+    /// dials a fresh Plugin client — same pattern as PluginService, kept
     /// separate since ProfileService needs its own Registry connection.
-    async fn store_client_for(
+    async fn plugin_client_for(
         &self,
         storefront: Storefront,
-    ) -> Result<Option<StoreClient<Channel>>, Status> {
+    ) -> Result<Option<PluginClient<Channel>>, Status> {
         let resolved = {
             let mut registry = self.registry.lock().await;
             registry
@@ -73,7 +68,7 @@ impl ProfileService {
             return Ok(None);
         };
 
-        let client = StoreClient::connect(endpoint.clone())
+        let client = PluginClient::connect(endpoint.clone())
             .await
             .map_err(|err| {
                 Status::unavailable(format!(
@@ -150,10 +145,11 @@ impl Profile for ProfileService {
     }
 
     /// Activates a profile: for every linked account, verifies/refreshes its
-    /// session via the owning StorePlugin and marks it AUTH_STATE_ACTIVE.
+    /// session via the owning plugin and marks it AUTH_STATE_ACTIVE.
     /// Does not perform login from scratch — accounts with AUTH_STATE_STALE
     /// are reported back, not silently re-authenticated (that requires the
-    /// interactive BeginLogin/CompleteLogin flow in StoreService).
+    /// interactive BeginLogin/CompleteLogin flow via PluginService and
+    /// AccountsService.LinkAccount).
     async fn activate_profile(
         &self,
         request: Request<ActivateProfileRequest>,
@@ -176,7 +172,7 @@ impl Profile for ProfileService {
                 continue;
             };
 
-            let outcome = match self.store_client_for(storefront).await {
+            let outcome = match self.plugin_client_for(storefront).await {
                 Ok(Some(mut client)) => {
                     match client
                         .refresh_session(RefreshSessionRequest {
@@ -230,150 +226,6 @@ impl Profile for ProfileService {
         }))
     }
 
-    async fn unlink_account(
-        &self,
-        request: Request<UnlinkAccountRequest>,
-    ) -> Result<Response<UserProfile>, Status> {
-        let req = request.into_inner();
-
-        // Best-effort: revoke on the owning plugin before dropping the
-        // LinkedAccount. A plugin that's unreachable shouldn't block
-        // unlinking on our side — log and proceed regardless.
-        if let Ok(storefront) = Storefront::try_from(req.storefront) {
-            match self.store_client_for(storefront).await {
-                Ok(Some(mut client)) => {
-                    if let Err(err) = client
-                        .revoke_session(RevokeSessionRequest {
-                            profile_id: req.profile_id.clone(),
-                            storefront: req.storefront,
-                        })
-                        .await
-                    {
-                        tracing::warn!("{storefront:?} RevokeSession failed: {err}");
-                    }
-                }
-                Ok(None) => tracing::debug!("no plugin registered for {storefront:?}, skipping revoke"),
-                Err(err) => tracing::warn!("failed to reach {storefront:?} plugin: {err}"),
-            }
-        }
-
-        let profile = self
-            .manager
-            .unlink_account(&req.profile_id, req.storefront)
-            .await
-            .map_err(to_status)?;
-        Ok(Response::new(profile))
-    }
-
-    /// Completes an interactive login started via Store.BeginLogin and
-    /// attaches the resulting LinkedAccount to the profile. Verifies the
-    /// profile exists up front so a bad profile_id fails fast instead of
-    /// burning the plugin's one-shot login challenge for nothing.
-    async fn link_account(
-        &self,
-        request: Request<LinkAccountRequest>,
-    ) -> Result<Response<UserProfile>, Status> {
-        let req = request.into_inner();
-
-        self.manager
-            .ensure_exists(&req.profile_id)
-            .await
-            .map_err(to_status)?;
-
-        let storefront = Storefront::try_from(req.storefront)
-            .map_err(|_| Status::invalid_argument("invalid storefront"))?;
-
-        let mut client = self
-            .store_client_for(storefront)
-            .await?
-            .ok_or_else(|| {
-                Status::unavailable(format!("no plugin registered for {storefront:?}"))
-            })?;
-
-        let account = client
-            .complete_login(CompleteLoginRequest {
-                challenge_id: req.challenge_id,
-                profile_id: req.profile_id.clone(),
-                storefront: req.storefront,
-                user_input: req.user_input,
-            })
-            .await?
-            .into_inner();
-
-        let profile = self
-            .manager
-            .link_account(&req.profile_id, account)
-            .await
-            .map_err(to_status)?;
-        Ok(Response::new(profile))
-    }
-
-    /// Links a Steam account by ID. Looks up the display name from the
-    /// local Steam install's loginusers.vdf on a best-effort basis (empty
-    /// if Steam isn't installed or the ID isn't found there). When
-    /// `auto_activate` is set, immediately runs the same activation path
-    /// as ActivateProfile so linked storefront accounts get refreshed too.
-    async fn link_steam_account(
-        &self,
-        request: Request<LinkSteamAccountRequest>,
-    ) -> Result<Response<UserProfile>, Status> {
-        let req = request.into_inner();
-
-        let account_name = {
-            let steam_id64 = req.steam_id64.clone();
-            tokio::task::spawn_blocking(move || crate::steam::account_name_for(&steam_id64))
-                .await
-                .ok()
-                .flatten()
-                .unwrap_or_default()
-        };
-
-        self.manager
-            .link_steam(
-                &req.profile_id,
-                SteamLink {
-                    steam_id64: req.steam_id64.clone(),
-                    account_name,
-                },
-            )
-            .await
-            .map_err(to_status)?;
-
-        if req.auto_activate {
-            let activated = self
-                .activate_profile(Request::new(ActivateProfileRequest {
-                    profile_id: req.profile_id.clone(),
-                    only: Vec::new(),
-                }))
-                .await?
-                .into_inner();
-            let profile = activated
-                .profile
-                .ok_or_else(|| Status::internal("activation didn't return a profile"))?;
-            return Ok(Response::new(profile));
-        }
-
-        let profile = self
-            .manager
-            .get(&req.profile_id)
-            .await
-            .map_err(to_status)?;
-        Ok(Response::new(profile))
-    }
-
-    async fn unlink_steam_account(
-        &self,
-        request: Request<UnlinkSteamAccountRequest>,
-    ) -> Result<Response<UserProfile>, Status> {
-        let profile_id = request.into_inner().profile_id;
-        let profile = self
-            .manager
-            .unlink_steam(&profile_id)
-            .await
-            .map_err(to_status)?;
-        Ok(Response::new(profile))
-    }
-
     type WatchActiveProfileStream =
         Pin<Box<dyn Stream<Item = Result<ProfileEvent, Status>> + Send + 'static>>;
 
@@ -384,17 +236,5 @@ impl Profile for ProfileService {
     ) -> Result<Response<Self::WatchActiveProfileStream>, Status> {
         let stream = self.manager.watch().map(Ok);
         Ok(Response::new(Box::pin(stream)))
-    }
-
-    type WatchSteamSessionsStream =
-        Pin<Box<dyn Stream<Item = Result<SteamSessionEvent, Status>> + Send + 'static>>;
-
-    /// Server-streaming: fires when Bottles detects the OS-level Steam
-    /// active user has changed (via filesystem watch on loginusers.vdf).
-    async fn watch_steam_sessions(
-        &self,
-        _request: Request<()>,
-    ) -> Result<Response<Self::WatchSteamSessionsStream>, Status> {
-        Ok(Response::new(crate::steam::watch_active_user()))
     }
 }

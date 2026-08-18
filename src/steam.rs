@@ -5,7 +5,7 @@ use std::pin::Pin;
 
 use bottles_core::steam::SteamUser;
 use futures_core::Stream;
-use next_proto::bottles::profiles::v1::SteamSessionEvent;
+use next_proto::bottles::steam::v1::SteamSessionEvent;
 use tokio_stream::StreamExt;
 use tonic::Status;
 

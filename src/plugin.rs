@@ -1,32 +1,33 @@
 use next_proto::bottles::{
     common::v1::{LinkedAccount, Storefront},
     library::v1::GameEvent,
-    registry::v1::{ResolvePluginRequest, registry_client::RegistryClient},
-    store::v1::{
+    plugin::v1::{
         BeginLoginRequest, CompleteLoginRequest, GetInstallManifestRequest, InstallManifest,
         ListGamesRequest, ListGamesResponse, LoginChallenge, RefreshSessionRequest,
-        RevokeSessionRequest, WatchGamesRequest, store_client::StoreClient, store_server::Store,
+        RevokeSessionRequest, WatchGamesRequest, plugin_client::PluginClient,
+        plugin_server::Plugin,
     },
+    registry::v1::{ResolvePluginRequest, registry_client::RegistryClient},
 };
 use std::pin::Pin;
 use tokio::sync::Mutex;
 use tonic::{Request, Response, Status, async_trait, transport::Channel};
 
-/// Forwards each Store call to the plugin that owns the request's
+/// Forwards each Plugin call to the plugin that owns the request's
 /// storefront, resolved fresh through the Registry on every call — the
 /// same pattern LibraryService uses to fan out ListGames.
-pub struct StoreService {
+pub struct PluginService {
     registry: Mutex<RegistryClient<Channel>>,
 }
 
-impl StoreService {
+impl PluginService {
     pub fn new(registry: RegistryClient<Channel>) -> Self {
         Self {
             registry: Mutex::new(registry),
         }
     }
 
-    async fn client_for(&self, storefront: Storefront) -> Result<StoreClient<Channel>, Status> {
+    async fn client_for(&self, storefront: Storefront) -> Result<PluginClient<Channel>, Status> {
         let resolved = {
             let mut registry = self.registry.lock().await;
             registry
@@ -41,7 +42,7 @@ impl StoreService {
             .endpoint
             .ok_or_else(|| Status::unavailable(format!("no plugin registered for {storefront:?}")))?;
 
-        StoreClient::connect(endpoint.clone()).await.map_err(|err| {
+        PluginClient::connect(endpoint.clone()).await.map_err(|err| {
             Status::unavailable(format!(
                 "failed to dial {storefront:?} plugin at {endpoint}: {err}"
             ))
@@ -54,7 +55,7 @@ impl StoreService {
 }
 
 #[async_trait]
-impl Store for StoreService {
+impl Plugin for PluginService {
     async fn begin_login(
         &self,
         request: Request<BeginLoginRequest>,
@@ -104,7 +105,7 @@ impl Store for StoreService {
         &self,
         request: Request<ListGamesRequest>,
     ) -> Result<Response<ListGamesResponse>, Status> {
-        // Store.ListGames is single-storefront; there's no storefront
+        // Plugin.ListGames is single-storefront; there's no storefront
         // field on the request itself here, so this entry point isn't
         // meaningful to proxy without one. Callers wanting an aggregate
         // view across storefronts should use Library.ListGames instead.
@@ -134,7 +135,7 @@ impl Store for StoreService {
     ) -> Result<Response<InstallManifest>, Status> {
         // Same reasoning as ListGames/WatchGames above: no storefront
         // field on this request to route on. Library.InstallGame calls
-        // Store.GetInstallManifest directly on the resolved plugin, since
+        // Plugin.GetInstallManifest directly on the resolved plugin, since
         // it has a storefront from its own request.
         let _ = request;
         Err(Status::unimplemented(
