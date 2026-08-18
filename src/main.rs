@@ -12,7 +12,7 @@ use bottles_server::{
 };
 use download_manager::manager::{DownloadManager, DownloadManagerConfig};
 use next_proto::bottles::{
-    accounts::v1::{accounts_client::AccountsClient, accounts_server::AccountsServer},
+    accounts::v1::accounts_server::AccountsServer,
     bottle::v1::bottle_server::BottleServer,
     library::v1::library_server::LibraryServer,
     plugin::v1::plugin_server::PluginServer,
@@ -100,8 +100,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let profile_manager = ProfileManager::new().await?;
 
-    let account_client = AccountsClient::connect(LISTEN_ADDR).await?;
-    let profile_service = ProfileService::new(profile_manager.clone(), account_client);
+    let profile_service = ProfileService::new(profile_manager.clone());
 
     let steam_service = SteamService::new(SteamManager::new(profile_manager.clone()));
 

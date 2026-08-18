@@ -10,7 +10,9 @@ use bottles_core::{
 };
 use next_proto::bottles::{
     accounts::v1::{
-        LinkProfileRequest, RefreshAccountRequest, UnlinkProfileRequest, accounts_server::Accounts,
+        AccountActivationResult, ActivateAccountsRequest, ActivateAccountsResponse,
+        ActivationOutcome, LinkProfileRequest, RefreshAccountRequest, UnlinkProfileRequest,
+        accounts_server::Accounts,
     },
     common::v1::{LinkedAccount, Storefront},
     plugin::v1::{
@@ -178,5 +180,75 @@ impl Accounts for AccountsService {
             .await
             .map_err(to_status)?;
         Ok(Response::new(()))
+    }
+
+    /// Refreshes credentials for a profile's linked accounts (or just
+    /// `only`, if given) via their owning plugins, persisting any updates.
+    async fn activate_accounts(
+        &self,
+        request: Request<ActivateAccountsRequest>,
+    ) -> Result<Response<ActivateAccountsResponse>, Status> {
+        let ActivateAccountsRequest { profile_id, only } = request.into_inner();
+
+        let mut profile = self.manager.get(&profile_id).await.map_err(to_status)?;
+
+        let mut results = Vec::new();
+
+        for account in profile.accounts.clone() {
+            let Ok(storefront) = Storefront::try_from(account.storefront) else {
+                continue;
+            };
+
+            if !only.is_empty() && !only.contains(&(storefront as i32)) {
+                continue;
+            }
+
+            let outcome = match self.plugin_client_for(storefront).await {
+                Ok(Some(mut client)) => match client
+                    .refresh_session(RefreshSessionRequest {
+                        profile_id: profile_id.clone(),
+                        storefront: storefront as i32,
+                    })
+                    .await
+                {
+                    Ok(response) => {
+                        let updated = response.into_inner();
+                        if let Some(existing) = profile
+                            .accounts
+                            .iter_mut()
+                            .find(|a| a.storefront == account.storefront)
+                        {
+                            *existing = updated;
+                        }
+                        AccountActivationResult {
+                            storefront: storefront as i32,
+                            outcome: ActivationOutcome::Success as i32,
+                            detail: String::new(),
+                        }
+                    }
+                    Err(err) => AccountActivationResult {
+                        storefront: storefront as i32,
+                        outcome: ActivationOutcome::CredentialStale as i32,
+                        detail: err.message().to_string(),
+                    },
+                },
+                Ok(None) => AccountActivationResult {
+                    storefront: storefront as i32,
+                    outcome: ActivationOutcome::PluginUnavailable as i32,
+                    detail: format!("no plugin registered for {storefront:?}"),
+                },
+                Err(status) => AccountActivationResult {
+                    storefront: storefront as i32,
+                    outcome: ActivationOutcome::NetworkError as i32,
+                    detail: status.message().to_string(),
+                },
+            };
+
+            results.push(outcome);
+        }
+
+        self.manager.update(profile).await.map_err(to_status)?;
+
+        Ok(Response::new(ActivateAccountsResponse { results }))
     }
 }
