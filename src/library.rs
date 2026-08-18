@@ -448,15 +448,24 @@ impl Library for LibraryService {
                         .and_then(|stem| stem.to_str())
                         .unwrap_or(&game_id)
                         .to_string();
-                    let program = bottles_core::Program::new(name, windows_path);
-                    let program_id = program.id.to_string();
-                    let mut edit = bottle.edit();
-                    edit.add_program(program);
-                    match edit.commit().await {
-                        Ok(()) => Some(program_id),
+                    match bottles_core::Program::new(name, windows_path) {
+                        Ok(program) => {
+                            let program_id = program.id().to_string();
+                            let mut edit = bottle.edit();
+                            edit.add_program(program);
+                            match edit.commit().await {
+                                Ok(()) => Some(program_id),
+                                Err(err) => {
+                                    tracing::warn!(
+                                        "failed to register launch program for {game_id}: {err}"
+                                    );
+                                    None
+                                }
+                            }
+                        }
                         Err(err) => {
                             tracing::warn!(
-                                "failed to register launch program for {game_id}: {err}"
+                                "invalid launch program for {game_id}: {err}"
                             );
                             None
                         }

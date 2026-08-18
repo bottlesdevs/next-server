@@ -60,7 +60,7 @@ fn to_status(err: CoreError) -> Status {
             BottleError::ComponentNotInstalled(_) | BottleError::RequiresAddon { .. },
         ) => Status::failed_precondition(message),
         CoreError::Bottle(
-            BottleError::InvalidProgram
+            BottleError::InvalidProgram(_)
             | BottleError::InvalidEnvironmentName(_)
             | BottleError::InvalidEnvironmentValue(_)
             | BottleError::InvalidDllName(_)
@@ -152,24 +152,27 @@ fn dependency_to_proto(dependency: &core::Addon<core::Dependency>) -> Dependency
 
 fn program_to_proto(program: &core::Program) -> Program {
     Program {
-        id: program.id.to_string(),
-        name: program.name.clone(),
-        executable: program.executable.clone(),
-        args: program.args.clone(),
-        working_directory: program.working_directory.clone(),
-        new_console: program.new_console,
+        id: program.id().to_string(),
+        name: program.name().to_string(),
+        executable: program.executable().to_string(),
+        args: program.args().to_vec(),
+        working_directory: program.working_directory().map(str::to_string),
+        new_console: program.new_console(),
     }
 }
 
-fn program_from_proto(program: Program) -> core::Program {
-    core::Program {
-        id: Uuid::parse_str(&program.id).unwrap_or_else(|_| Uuid::new_v4()),
-        name: program.name,
-        executable: program.executable,
-        args: program.args,
-        working_directory: program.working_directory,
-        new_console: program.new_console,
+/// Programs are immutable and UUID-keyed — there's no in-place edit, so
+/// any incoming `id` is ignored and a fresh identity is always minted;
+/// "editing" a program is remove-then-add at the call site.
+fn program_from_proto(program: Program) -> Result<core::Program, Status> {
+    let mut built = core::Program::new(program.name, program.executable)
+        .map_err(to_status)?
+        .with_args(program.args)
+        .with_new_console(program.new_console);
+    if let Some(working_directory) = program.working_directory {
+        built = built.with_working_directory(working_directory).map_err(to_status)?;
     }
+    Ok(built)
 }
 
 fn scaler_to_proto(scaler: core::GamescopeScaler) -> proto::Scaler {
@@ -271,7 +274,7 @@ fn bottle_state_to_proto(state: &core::BottleState) -> BottleState {
         id: state.id().to_string(),
         name: state.name().to_string(),
         storage: storage_to_proto(state.storage()) as i32,
-        programs: state.programs().iter().map(program_to_proto).collect(),
+        programs: state.programs().map(program_to_proto).collect(),
         components: state
             .components()
             .iter()
@@ -496,7 +499,7 @@ impl bottle_server::Bottle for BottleService {
                     edit.unset_env(&key);
                 }
                 edit_operation::Change::AddProgram(program) => {
-                    edit.add_program(program_from_proto(program));
+                    edit.add_program(program_from_proto(program)?);
                 }
                 edit_operation::Change::RemoveProgramId(id) => {
                     let id = Uuid::parse_str(&id)
@@ -602,7 +605,7 @@ impl bottle_server::Bottle for BottleService {
         let bottle = self.open(&req.bottle_id).await?;
         let program_id = Uuid::parse_str(&req.program_id)
             .map_err(|_| Status::invalid_argument("invalid program_id"))?;
-        let pid = bottle.run(program_id).await.map_err(to_status)?;
+        let pid = bottle.launch_program(program_id).await.map_err(to_status)?;
         Ok(Response::new(RunProgramResponse { pid }))
     }
 
@@ -623,7 +626,7 @@ impl bottle_server::Bottle for BottleService {
         let bottle = self.open(&req.bottle_id).await?;
         let program_id = Uuid::parse_str(&req.program_id)
             .map_err(|_| Status::invalid_argument("invalid program_id"))?;
-        bottle.kill(program_id).await.map_err(to_status)?;
+        bottle.kill_program(program_id).await.map_err(to_status)?;
         Ok(Response::new(()))
     }
 
