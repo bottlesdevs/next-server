@@ -286,21 +286,44 @@ impl Library for LibraryService {
         // own) — install under the storefront's own canonical folder
         // name, matching where its official client would put them,
         // rather than dumping files straight at the drive root.
-        let install_root_name = format!("Program Files/{}", manifest.install_directory);
+        //
+        // `install_directory` and every file's `relative_path` come
+        // from the storefront plugin's manifest response — a separate,
+        // dynamically-resolved process relaying storefront-CDN data,
+        // not trusted input. Reject anything that isn't a plain relative
+        // path *before* it's ever joined onto the bottle's `C:` drive or
+        // persisted, so a malicious/compromised plugin can't traverse
+        // out of the install directory to write (or later, on
+        // uninstall, delete) arbitrary files on the host.
+        let install_directory = bottles_core::library::sanitize_relative_path(
+            &manifest.install_directory,
+        )
+        .ok_or_else(|| Status::invalid_argument("invalid install_directory in manifest"))?;
+        let install_root_name = format!("Program Files/{}", install_directory.display());
         let destination_root = c_drive.join(&install_root_name);
 
         let files = manifest
             .files
             .iter()
             .map(|file| {
+                let relative_path = bottles_core::library::sanitize_relative_path(
+                    &file.relative_path,
+                )
+                .ok_or_else(|| {
+                    Status::invalid_argument(format!(
+                        "invalid relative_path in manifest: {}",
+                        file.relative_path
+                    ))
+                })?
+                .to_string_lossy()
+                .into_owned();
                 let chunks = file
                     .chunks
                     .iter()
                     .map(|chunk| {
                         let url = url::Url::parse(&chunk.download_url).map_err(|err| {
                             Status::invalid_argument(format!(
-                                "bad chunk URL for {}: {err}",
-                                file.relative_path
+                                "bad chunk URL for {relative_path}: {err}"
                             ))
                         })?;
                         Ok(ChunkSource {
@@ -310,7 +333,7 @@ impl Library for LibraryService {
                     })
                     .collect::<Result<Vec<_>, Status>>()?;
                 Ok(InstallFile {
-                    relative_path: file.relative_path.clone(),
+                    relative_path,
                     chunks,
                 })
             })
