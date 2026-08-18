@@ -4,7 +4,10 @@
 
 use std::pin::Pin;
 
-use bottles_core::{profile::error::ProfileError, steam::SteamManager};
+use bottles_core::{
+    profile::error::ProfileError,
+    steam::{SteamError, SteamManager, account_name_for},
+};
 use futures_core::Stream;
 use next_proto::bottles::steam::v1::{
     LinkSteamAccountRequest, SteamLink, SteamSessionEvent, UnlinkSteamAccountRequest,
@@ -19,7 +22,7 @@ fn to_status(err: bottles_core::Error) -> Status {
         bottles_core::Error::Profile(ProfileError::NotFound(_)) => {
             Status::not_found(err.to_string())
         }
-        bottles_core::Error::Profile(ProfileError::SteamAccountAlreadyLinked { .. }) => {
+        bottles_core::Error::Steam(SteamError::SteamAccountAlreadyLinked { .. }) => {
             Status::already_exists(err.to_string())
         }
         _ => Status::internal(err.to_string()),
@@ -45,10 +48,29 @@ impl Steam for SteamService {
         &self,
         request: Request<LinkSteamAccountRequest>,
     ) -> Result<Response<SteamLink>, Status> {
-        let req = request.into_inner();
+        let LinkSteamAccountRequest {
+            profile_id,
+            steam_id64,
+            ..
+        } = request.into_inner();
+
+        let account_name = {
+            let steam_id64 = steam_id64.clone();
+            tokio::task::spawn_blocking(move || account_name_for(&steam_id64))
+                .await
+                .ok()
+                .flatten()
+                .unwrap_or_default()
+        };
+
+        let steam_link = SteamLink {
+            steam_id64,
+            account_name,
+        };
+
         let steam_link = self
             .manager
-            .link_account(&req.profile_id, req.steam_id64)
+            .link_account(&profile_id, steam_link)
             .await
             .map_err(to_status)?;
         Ok(Response::new(steam_link))

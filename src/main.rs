@@ -1,6 +1,7 @@
 use std::{sync::Arc, time::Duration};
 
 use bottles_core::{
+    accounts::AccountManager,
     library::{InstallManager, InstallsStore},
     profile::ProfileManager,
     steam::SteamManager,
@@ -105,7 +106,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let steam_service = SteamService::new(SteamManager::new(profile_manager.clone()));
 
     let accounts_registry_client = RegistryClient::connect(REGISTRY_ENDPOINT).await?;
-    let accounts_service = AccountsService::new(profile_manager, accounts_registry_client);
+    let account_manager = AccountManager::new(profile_manager.clone());
+    let accounts_service =
+        AccountsService::new(profile_manager, account_manager, accounts_registry_client);
 
     tracing::info!("Server started on http://{LISTEN_ADDR}");
 

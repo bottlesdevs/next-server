@@ -4,10 +4,13 @@
 //! since it needs its own Registry/Plugin dialing, same as `ProfileService`
 //! does for activation.
 
-use bottles_core::profile::{ProfileManager, error::ProfileError};
+use bottles_core::{
+    accounts::AccountManager,
+    profile::{ProfileManager, error::ProfileError},
+};
 use next_proto::bottles::{
     accounts::v1::{
-        LinkAccountRequest, RefreshAccountRequest, UnlinkAccountRequest, accounts_server::Accounts,
+        LinkProfileRequest, RefreshAccountRequest, UnlinkProfileRequest, accounts_server::Accounts,
     },
     common::v1::{LinkedAccount, Storefront},
     plugin::v1::{
@@ -31,13 +34,19 @@ fn to_status(err: bottles_core::Error) -> Status {
 
 pub struct AccountsService {
     manager: ProfileManager,
+    accounts: AccountManager,
     registry: Mutex<RegistryClient<Channel>>,
 }
 
 impl AccountsService {
-    pub fn new(manager: ProfileManager, registry: RegistryClient<Channel>) -> Self {
+    pub fn new(
+        manager: ProfileManager,
+        accounts: AccountManager,
+        registry: RegistryClient<Channel>,
+    ) -> Self {
         Self {
             manager,
+            accounts,
             registry: Mutex::new(registry),
         }
     }
@@ -78,15 +87,20 @@ impl Accounts for AccountsService {
     /// attaches the resulting LinkedAccount to the profile. Verifies the
     /// profile exists up front so a bad profile_id fails fast instead of
     /// burning the plugin's one-shot login challenge for nothing.
-    async fn link_account(
+    async fn link_profile(
         &self,
-        request: Request<LinkAccountRequest>,
+        request: Request<LinkProfileRequest>,
     ) -> Result<Response<LinkedAccount>, Status> {
-        let req = request.into_inner();
+        let LinkProfileRequest {
+            profile_id,
+            challenge_id,
+            storefront,
+            user_input,
+        } = request.into_inner();
 
-        self.manager.get(&req.profile_id).await.map_err(to_status)?;
+        self.manager.get(&profile_id).await.map_err(to_status)?;
 
-        let storefront = Storefront::try_from(req.storefront)
+        let storefront = Storefront::try_from(storefront)
             .map_err(|_| Status::invalid_argument("invalid storefront"))?;
 
         let mut client = self.plugin_client_for(storefront).await?.ok_or_else(|| {
@@ -95,16 +109,16 @@ impl Accounts for AccountsService {
 
         let account = client
             .complete_login(CompleteLoginRequest {
-                challenge_id: req.challenge_id,
-                profile_id: req.profile_id.clone(),
-                storefront: req.storefront,
-                user_input: req.user_input,
+                challenge_id: challenge_id,
+                profile_id: profile_id.clone(),
+                storefront: storefront as i32,
+                user_input: user_input,
             })
             .await?
             .into_inner();
 
-        self.manager
-            .link_account(&req.profile_id, account.clone())
+        self.accounts
+            .link_profile(&profile_id, account.clone())
             .await
             .map_err(to_status)?;
         Ok(Response::new(account))
@@ -130,37 +144,37 @@ impl Accounts for AccountsService {
         Ok(account)
     }
 
-    async fn unlink_account(
+    async fn unlink_profile(
         &self,
-        request: Request<UnlinkAccountRequest>,
+        request: Request<UnlinkProfileRequest>,
     ) -> Result<Response<()>, Status> {
-        let req = request.into_inner();
+        let UnlinkProfileRequest {
+            profile_id,
+            storefront,
+        } = request.into_inner();
 
-        // Best-effort: revoke on the owning plugin before dropping the
-        // LinkedAccount. A plugin that's unreachable shouldn't block
-        // unlinking on our side — log and proceed regardless.
-        if let Ok(storefront) = Storefront::try_from(req.storefront) {
-            match self.plugin_client_for(storefront).await {
-                Ok(Some(mut client)) => {
-                    if let Err(err) = client
-                        .revoke_session(RevokeSessionRequest {
-                            profile_id: req.profile_id.clone(),
-                            storefront: req.storefront,
-                        })
-                        .await
-                    {
-                        tracing::warn!("{storefront:?} RevokeSession failed: {err}");
-                    }
+        let storefront = Storefront::try_from(storefront)
+            .map_err(|_| Status::not_found("invalid storefront"))?;
+        match self.plugin_client_for(storefront).await {
+            Ok(Some(mut client)) => {
+                if let Err(err) = client
+                    .revoke_session(RevokeSessionRequest {
+                        profile_id: profile_id.clone(),
+                        storefront: storefront as i32,
+                    })
+                    .await
+                {
+                    tracing::warn!("{storefront:?} RevokeSession failed: {err}");
                 }
-                Ok(None) => {
-                    tracing::debug!("no plugin registered for {storefront:?}, skipping revoke")
-                }
-                Err(err) => tracing::warn!("failed to reach {storefront:?} plugin: {err}"),
             }
+            Ok(None) => {
+                tracing::debug!("no plugin registered for {storefront:?}, skipping revoke")
+            }
+            Err(err) => tracing::warn!("failed to reach {storefront:?} plugin: {err}"),
         }
 
-        self.manager
-            .unlink_account(&req.profile_id, req.storefront)
+        self.accounts
+            .unlink_profile(&profile_id, storefront)
             .await
             .map_err(to_status)?;
         Ok(Response::new(()))
