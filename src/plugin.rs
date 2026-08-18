@@ -38,15 +38,17 @@ impl PluginService {
                 .into_inner()
         };
 
-        let endpoint = resolved
-            .endpoint
-            .ok_or_else(|| Status::unavailable(format!("no plugin registered for {storefront:?}")))?;
+        let endpoint = resolved.endpoint.ok_or_else(|| {
+            Status::unavailable(format!("no plugin registered for {storefront:?}"))
+        })?;
 
-        PluginClient::connect(endpoint.clone()).await.map_err(|err| {
-            Status::unavailable(format!(
-                "failed to dial {storefront:?} plugin at {endpoint}: {err}"
-            ))
-        })
+        PluginClient::connect(endpoint.clone())
+            .await
+            .map_err(|err| {
+                Status::unavailable(format!(
+                    "failed to dial {storefront:?} plugin at {endpoint}: {err}"
+                ))
+            })
     }
 
     fn parse_storefront(raw: i32) -> Result<Storefront, Status> {
@@ -71,10 +73,7 @@ impl Plugin for PluginService {
     ) -> Result<Response<LinkedAccount>, Status> {
         let req = request.into_inner();
         let storefront = Self::parse_storefront(req.storefront)?;
-        self.client_for(storefront)
-            .await?
-            .complete_login(req)
-            .await
+        self.client_for(storefront).await?.complete_login(req).await
     }
 
     async fn refresh_session(
@@ -95,10 +94,7 @@ impl Plugin for PluginService {
     ) -> Result<Response<()>, Status> {
         let req = request.into_inner();
         let storefront = Self::parse_storefront(req.storefront)?;
-        self.client_for(storefront)
-            .await?
-            .revoke_session(req)
-            .await
+        self.client_for(storefront).await?.revoke_session(req).await
     }
 
     async fn list_games(
@@ -115,7 +111,8 @@ impl Plugin for PluginService {
         ))
     }
 
-    type WatchGamesStream = Pin<Box<dyn futures_core::Stream<Item = Result<GameEvent, Status>> + Send + 'static>>;
+    type WatchGamesStream =
+        Pin<Box<dyn futures_core::Stream<Item = Result<GameEvent, Status>> + Send + 'static>>;
 
     async fn watch_games(
         &self,

@@ -1,15 +1,22 @@
 use std::{sync::Arc, time::Duration};
 
-use bottles_core::{library::InstallsStore, profile::ProfileManager};
+use bottles_core::{
+    library::{InstallManager, InstallsStore},
+    profile::ProfileManager,
+    steam::SteamManager,
+};
 use bottles_server::{
     accounts::AccountsService, bottle::BottleService, library::LibraryService,
     plugin::PluginService, profile::ProfileService, steam_service::SteamService,
 };
 use download_manager::manager::{DownloadManager, DownloadManagerConfig};
 use next_proto::bottles::{
-    accounts::v1::accounts_server::AccountsServer, bottle::v1::bottle_server::BottleServer,
-    library::v1::library_server::LibraryServer, plugin::v1::plugin_server::PluginServer,
-    profiles::v1::profile_server::ProfileServer, registry::v1::registry_client::RegistryClient,
+    accounts::v1::{accounts_client::AccountsClient, accounts_server::AccountsServer},
+    bottle::v1::bottle_server::BottleServer,
+    library::v1::library_server::LibraryServer,
+    plugin::v1::plugin_server::PluginServer,
+    profiles::v1::profile_server::ProfileServer,
+    registry::v1::registry_client::RegistryClient,
     steam::v1::steam_server::SteamServer,
 };
 use tonic_health::server::health_reporter;
@@ -73,16 +80,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             .map_err(|err| format!("failed to start download manager: {err}"))?,
     );
     let installs = Arc::new(InstallsStore::load().await?);
+    let install_manager = Arc::new(InstallManager::new(downloads, installs));
 
     let bottles = bottles_core::Bottles::open(bottles_core::Config::default()).await?;
     let bottle_service = BottleService::new(bottles.bottles().clone());
 
     let library_registry_client = RegistryClient::connect(REGISTRY_ENDPOINT).await?;
-    let profile = ProfileManager::load().await?;
+    let profile = ProfileManager::new().await?;
     let library_service = LibraryService::new(
         library_registry_client,
-        downloads,
-        installs,
+        install_manager,
         profile,
         bottles.bottles().clone(),
     );
@@ -90,12 +97,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let plugin_registry_client = RegistryClient::connect(REGISTRY_ENDPOINT).await?;
     let plugin_service = PluginService::new(plugin_registry_client);
 
-    let profile_manager = ProfileManager::load().await?;
+    let profile_manager = ProfileManager::new().await?;
 
-    let profile_registry_client = RegistryClient::connect(REGISTRY_ENDPOINT).await?;
-    let profile_service = ProfileService::new(profile_manager.clone(), profile_registry_client);
+    let account_client = AccountsClient::connect(LISTEN_ADDR).await?;
+    let profile_service = ProfileService::new(profile_manager.clone(), account_client);
 
-    let steam_service = SteamService::new(profile_manager.clone());
+    let steam_service = SteamService::new(SteamManager::new(profile_manager.clone()));
 
     let accounts_registry_client = RegistryClient::connect(REGISTRY_ENDPOINT).await?;
     let accounts_service = AccountsService::new(profile_manager, accounts_registry_client);

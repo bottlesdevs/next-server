@@ -128,7 +128,11 @@ fn component_to_proto(component: &core::Addon<core::Component>) -> Component {
         id: component.id().to_string(),
         name: component.name().to_string(),
         version: component.version().to_string(),
-        requirements: component.requirements().iter().map(requirement_to_proto).collect(),
+        requirements: component
+            .requirements()
+            .iter()
+            .map(requirement_to_proto)
+            .collect(),
         slot: slot_to_proto(component.slot()) as i32,
     }
 }
@@ -138,7 +142,11 @@ fn dependency_to_proto(dependency: &core::Addon<core::Dependency>) -> Dependency
         id: dependency.id().to_string(),
         name: dependency.name().to_string(),
         version: dependency.version().to_string(),
-        requirements: dependency.requirements().iter().map(requirement_to_proto).collect(),
+        requirements: dependency
+            .requirements()
+            .iter()
+            .map(requirement_to_proto)
+            .collect(),
     }
 }
 
@@ -232,8 +240,14 @@ fn gamescope_from_proto(config: GamescopeConfig) -> core::GamescopeConfig {
         output_height: config.output_height,
         frame_rate: config.frame_rate,
         unfocused_frame_rate: config.unfocused_frame_rate,
-        scaler: config.scaler.and_then(|s| proto::Scaler::try_from(s).ok()).and_then(scaler_from_proto),
-        filter: config.filter.and_then(|f| proto::Filter::try_from(f).ok()).and_then(filter_from_proto),
+        scaler: config
+            .scaler
+            .and_then(|s| proto::Scaler::try_from(s).ok())
+            .and_then(scaler_from_proto),
+        filter: config
+            .filter
+            .and_then(|f| proto::Filter::try_from(f).ok())
+            .and_then(filter_from_proto),
         sharpness: config.sharpness.and_then(|s| u8::try_from(s).ok()),
         borderless: config.borderless,
         fullscreen: config.fullscreen,
@@ -263,7 +277,11 @@ fn bottle_state_to_proto(state: &core::BottleState) -> BottleState {
             .iter()
             .map(|(slot, component)| (slot.as_str().to_string(), component_to_proto(component)))
             .collect(),
-        dependencies: state.dependencies().iter().map(dependency_to_proto).collect(),
+        dependencies: state
+            .dependencies()
+            .iter()
+            .map(dependency_to_proto)
+            .collect(),
         environment: state
             .environment()
             .iter()
@@ -351,7 +369,8 @@ impl bottle_server::Bottle for BottleService {
         request: Request<CreateBottleRequest>,
     ) -> Result<Response<Self::CreateBottleStream>, Status> {
         let req = request.into_inner();
-        let storage = storage_from_proto(proto::Storage::try_from(req.storage).unwrap_or_default())?;
+        let storage =
+            storage_from_proto(proto::Storage::try_from(req.storage).unwrap_or_default())?;
         let runner = Uuid::parse_str(&req.runner_component_id)
             .map_err(|_| Status::invalid_argument("invalid runner_component_id"))?;
 
@@ -398,13 +417,19 @@ impl bottle_server::Bottle for BottleService {
         Ok(Response::new(Box::pin(ReceiverStream::new(rx))))
     }
 
-    async fn get_bottle(&self, request: Request<BottleRequest>) -> Result<Response<BottleState>, Status> {
+    async fn get_bottle(
+        &self,
+        request: Request<BottleRequest>,
+    ) -> Result<Response<BottleState>, Status> {
         let bottle = self.open(&request.into_inner().bottle_id).await?;
         let state = bottle.state().map_err(to_status)?;
         Ok(Response::new(bottle_state_to_proto(&state)))
     }
 
-    async fn list_bottles(&self, _request: Request<()>) -> Result<Response<ListBottlesResponse>, Status> {
+    async fn list_bottles(
+        &self,
+        _request: Request<()>,
+    ) -> Result<Response<ListBottlesResponse>, Status> {
         let mut bottles = Vec::new();
         for bottle in self.manager.list() {
             if let Ok(state) = bottle.state() {
@@ -442,7 +467,9 @@ impl bottle_server::Bottle for BottleService {
         use tokio_stream::StreamExt;
 
         let bottle = self.open(&request.into_inner().bottle_id).await?;
-        let stream = bottle.watch().map(|state| Ok(bottle_state_to_proto(&state)));
+        let stream = bottle
+            .watch()
+            .map(|state| Ok(bottle_state_to_proto(&state)));
         Ok(Response::new(Box::pin(stream)))
     }
 
@@ -588,7 +615,10 @@ impl bottle_server::Bottle for BottleService {
         Ok(Response::new(ListProcessesResponse { processes }))
     }
 
-    async fn kill_process(&self, request: Request<KillProcessRequest>) -> Result<Response<()>, Status> {
+    async fn kill_process(
+        &self,
+        request: Request<KillProcessRequest>,
+    ) -> Result<Response<()>, Status> {
         let req = request.into_inner();
         let bottle = self.open(&req.bottle_id).await?;
         let program_id = Uuid::parse_str(&req.program_id)
@@ -620,7 +650,10 @@ impl bottle_server::Bottle for BottleService {
         let bottle = self.open(&req.bottle_id).await?;
         let mode = next_proto::winebridge::DllOverrideMode::try_from(req.mode)
             .map_err(|_| Status::invalid_argument("invalid dll override mode"))?;
-        bottle.set_dll_override(req.dll, mode).await.map_err(to_status)?;
+        bottle
+            .set_dll_override(req.dll, mode)
+            .await
+            .map_err(to_status)?;
         Ok(Response::new(()))
     }
 
@@ -630,7 +663,10 @@ impl bottle_server::Bottle for BottleService {
     ) -> Result<Response<()>, Status> {
         let req = request.into_inner();
         let bottle = self.open(&req.bottle_id).await?;
-        bottle.unset_dll_override(req.dll).await.map_err(to_status)?;
+        bottle
+            .unset_dll_override(req.dll)
+            .await
+            .map_err(to_status)?;
         Ok(Response::new(()))
     }
 

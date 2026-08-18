@@ -1,6 +1,5 @@
-use std::{collections::HashMap, pin::Pin, sync::Arc};
+use std::{pin::Pin, sync::Arc};
 
-use download_manager::{download::Download, manager::DownloadManager};
 use futures_core::Stream;
 use next_proto::bottles::{
     common::v1::{AuthState, Storefront},
@@ -21,42 +20,43 @@ use tonic::{Request, Response, Status, async_trait, transport::Channel};
 
 use bottles_core::{
     BottleManager,
-    library::{InstallRecord, InstallsStore, install_dir},
+    library::{InstallChunk, InstallEvent, InstallFile, InstallManager, install_dir},
     profile::ProfileManager,
 };
 use uuid::Uuid;
-
-/// Identifies one in-flight install for `CancelInstall` to find.
-type InstallKey = (String, i32, String);
 
 /// Aggregates game libraries across storefronts by resolving each
 /// storefront's owning plugin through the Registry, then calling
 /// Store.ListGames on that plugin directly. No in-process plugin
 /// objects are held here — everything is a fresh RPC per call.
+///
+/// Installing a game splits cleanly across the two crates: this service
+/// resolves the owning plugin and fetches its manifest (gRPC, so it
+/// can't live in `next-core`), then hands the manifest's files to
+/// `bottles_core::library::InstallManager`, which owns the storefront-
+/// agnostic parts — downloading, reassembling, and persisting the
+/// install. Picking a launch executable from the downloaded files is a
+/// storefront-specific heuristic (GOG in particular), so it stays here
+/// too, alongside registering the resulting `Program` on the bottle.
 pub struct LibraryService {
     registry: Mutex<RegistryClient<Channel>>,
-    downloads: Arc<DownloadManager>,
-    installs: Arc<InstallsStore>,
+    install_manager: Arc<InstallManager>,
     bottles: BottleManager,
     profile: ProfileManager,
-    active_installs: Arc<Mutex<HashMap<InstallKey, Vec<Download>>>>,
 }
 
 impl LibraryService {
     pub fn new(
         registry: RegistryClient<Channel>,
-        downloads: Arc<DownloadManager>,
-        installs: Arc<InstallsStore>,
+        install_manager: Arc<InstallManager>,
         profile: ProfileManager,
         bottles: BottleManager,
     ) -> Self {
         Self {
             registry: Mutex::new(registry),
-            downloads,
-            installs,
+            install_manager,
             profile,
             bottles,
-            active_installs: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -148,7 +148,11 @@ impl Library for LibraryService {
             let Ok(storefront) = Storefront::try_from(game.storefront) else {
                 continue;
             };
-            if let Some(record) = self.installs.get(&profile_id, storefront, &game.id).await {
+            if let Some(record) = self
+                .install_manager
+                .get(&profile_id, storefront, &game.id)
+                .await
+            {
                 game.install_state = Some(record.install_state());
             }
         }
@@ -223,12 +227,13 @@ impl Library for LibraryService {
     type InstallGameStream =
         Pin<Box<dyn Stream<Item = Result<InstallGameEvent, Status>> + Send + 'static>>;
 
-    /// Resolves the owning plugin's install manifest and downloads every
-    /// file directly into `bottle_id`'s `C:` drive, then registers the
-    /// discovered launch executable (see `find_primary_executable`) as a
-    /// `Program` on that bottle before persisting an `InstallRecord`.
-    /// Progress from every file's download is forwarded as it happens;
-    /// the stream ends with one `done` event.
+    /// Resolves the owning plugin's install manifest, then delegates the
+    /// storefront-agnostic download/reassembly/persistence work to
+    /// `InstallManager`. Once every file has landed, picks a launch
+    /// executable (see `find_primary_executable`) and registers it as a
+    /// `Program` on the bottle before recording the install. Progress
+    /// from every file's download is forwarded as it happens; the
+    /// stream ends with one `done` event.
     async fn install_game(
         &self,
         request: Request<InstallGameRequest>,
@@ -266,231 +271,140 @@ impl Library for LibraryService {
         // own) — install under the storefront's own canonical folder
         // name, matching where its official client would put them,
         // rather than dumping files straight at the drive root.
-        let install_root = format!("Program Files/{}", manifest.install_directory);
+        let install_root_name = format!("Program Files/{}", manifest.install_directory);
+        let destination_root = c_drive.join(&install_root_name);
 
         // Chunks land here temporarily before being decompressed and
         // concatenated straight into the bottle's C: drive — this is
         // just scratch space, never the final install location.
         let staging_dir = install_dir(&profile_id, storefront_enum, &game_id)?;
-        let downloads = self.downloads.clone();
-        let installs = self.installs.clone();
-        let key: InstallKey = (profile_id.clone(), storefront, game_id.clone());
+
+        let files = manifest
+            .files
+            .iter()
+            .map(|file| InstallFile {
+                relative_path: file.relative_path.clone(),
+                chunks: file
+                    .chunks
+                    .iter()
+                    .map(|chunk| InstallChunk {
+                        download_url: chunk.download_url.clone(),
+                        compressed: chunk.compressed,
+                    })
+                    .collect(),
+            })
+            .collect();
+
+        let key = (profile_id.clone(), storefront, game_id.clone());
+        let mut downloads = self.install_manager.download(
+            key,
+            destination_root,
+            install_root_name,
+            staging_dir,
+            files,
+        );
+        let install_manager = self.install_manager.clone();
 
         let (tx, rx) = mpsc::channel(32);
-        let mut all_handles = Vec::new();
-        // Per file: (relative_path, one Download per chunk, that chunk's
-        // temp path, whether it needs zlib decompression). Chunks
-        // download independently, then get concatenated in order once
-        // every chunk for that file has landed — see `reassemble_file`.
-        let mut file_downloads = Vec::with_capacity(manifest.files.len());
 
-        for file in &manifest.files {
-            let mut chunk_downloads = Vec::with_capacity(file.chunks.len());
-            let mut chunk_temp_paths = Vec::with_capacity(file.chunks.len());
-            let mut chunk_compressed = Vec::with_capacity(file.chunks.len());
-            let mut chunk_urls = Vec::with_capacity(file.chunks.len());
-
-            for (index, chunk) in file.chunks.iter().enumerate() {
-                let url = match url::Url::parse(&chunk.download_url) {
-                    Ok(url) => url,
-                    Err(err) => {
-                        let _ = tx
-                            .send(Err(Status::internal(format!(
-                                "bad chunk URL for {}: {err}",
-                                file.relative_path
-                            ))))
-                            .await;
-                        return Ok(Response::new(Box::pin(ReceiverStream::new(rx))));
-                    }
-                };
-                let temp_path = staging_dir.join(".chunks").join(format!(
-                    "{}.{index}",
-                    file.relative_path.replace(['/', '\\'], "_")
-                ));
-                if let Some(parent) = temp_path.parent()
-                    && let Err(err) = tokio::fs::create_dir_all(parent).await
-                {
-                    let _ = tx.send(Err(Status::internal(err.to_string()))).await;
-                    return Ok(Response::new(Box::pin(ReceiverStream::new(rx))));
-                }
-
-                let download = match downloads.download(url, temp_path.clone()) {
-                    Ok(download) => download,
-                    Err(err) => {
-                        let _ = tx
-                            .send(Err(Status::internal(format!(
-                                "failed to enqueue a chunk of {}: {err}",
-                                file.relative_path
-                            ))))
-                            .await;
-                        return Ok(Response::new(Box::pin(ReceiverStream::new(rx))));
-                    }
-                };
-                all_handles.push(download.clone());
-
-                let relative_path = file.relative_path.clone();
-                let progress_tx = tx.clone();
-                let progress_download = download.clone();
-                tokio::spawn(async move {
-                    let stream = progress_download.progress();
-                    tokio::pin!(stream);
-                    while let Some(progress) = stream.next().await {
+        tokio::spawn(async move {
+            while let Some(item) = downloads.next().await {
+                match item {
+                    Ok(InstallEvent::Progress(progress)) => {
                         let event = InstallGameEvent {
                             event: Some(install_game_event::Event::Progress(InstallProgress {
-                                current_file: relative_path.clone(),
-                                bytes_downloaded: progress.bytes_downloaded(),
-                                total_bytes: progress.total_bytes(),
-                                bytes_per_second: progress.bytes_per_second(),
+                                current_file: progress.current_file,
+                                bytes_downloaded: progress.bytes_downloaded,
+                                total_bytes: progress.total_bytes,
+                                bytes_per_second: progress.bytes_per_second,
                             })),
                         };
-                        if progress_tx.send(Ok(event)).await.is_err() {
+                        if tx.send(Ok(event)).await.is_err() {
                             return;
                         }
                     }
-                });
+                    Ok(InstallEvent::Done {
+                        relative_paths,
+                        install_size_bytes,
+                    }) => {
+                        // Epic sets this directly (launch_exe). GOG
+                        // never does — in principle it's knowable
+                        // post-download from a goggame-<id>.info file
+                        // shipped as a depot file (see plugin.proto's
+                        // doc comment), but that file isn't always
+                        // present, so that lookup is kept as a first
+                        // try, not relied on, and backed by a heuristic
+                        // scan of the install root that doesn't depend
+                        // on GOG providing anything extra.
+                        let primary_executable = manifest
+                            .primary_executable
+                            .clone()
+                            .or_else(|| find_goggame_primary_executable(&c_drive, &relative_paths))
+                            .or_else(|| {
+                                find_primary_executable_heuristic(
+                                    &relative_paths,
+                                    &manifest.install_directory,
+                                )
+                            });
 
-                chunk_downloads.push(download);
-                chunk_temp_paths.push(temp_path);
-                chunk_compressed.push(chunk.compressed);
-                chunk_urls.push(chunk.download_url.clone());
-            }
-
-            file_downloads.push((
-                file.relative_path.clone(),
-                chunk_downloads,
-                chunk_temp_paths,
-                chunk_compressed,
-                chunk_urls,
-            ));
-        }
-
-        self.active_installs
-            .lock()
-            .await
-            .insert(key.clone(), all_handles);
-        let active_installs = self.active_installs.clone();
-
-        tokio::spawn(async move {
-            let mut relative_paths = Vec::with_capacity(file_downloads.len());
-            let mut install_size_bytes = Some(0u64);
-            let mut failed = false;
-
-            'files: for (
-                relative_path,
-                chunk_downloads,
-                chunk_temp_paths,
-                chunk_compressed,
-                chunk_urls,
-            ) in file_downloads
-            {
-                for (download, url) in chunk_downloads.iter().zip(&chunk_urls) {
-                    if let Err(err) = download.clone().await {
-                        tracing::warn!("chunk download failed for {relative_path} ({url}): {err}");
-                        let _ = tx
-                            .send(Err(Status::internal(format!(
-                                "{relative_path} ({url}): {err}"
-                            ))))
-                            .await;
-                        failed = true;
-                        break 'files;
-                    }
-                }
-
-                let destination = c_drive.join(&install_root).join(&relative_path);
-                match reassemble_file(&destination, &chunk_temp_paths, &chunk_compressed).await {
-                    Ok(size) => {
-                        // Stored (and used for goggame-*.info discovery
-                        // below) with `install_root` baked in, so it's
-                        // already a full path relative to `c_drive` —
-                        // callers never need to know `install_root`
-                        // separately.
-                        relative_paths.push(format!("{install_root}/{relative_path}"));
-                        install_size_bytes = install_size_bytes.zip(Some(size)).map(|(a, b)| a + b);
-                    }
-                    Err(err) => {
-                        let _ = tx.send(Err(Status::internal(err.to_string()))).await;
-                        failed = true;
-                        break 'files;
-                    }
-                }
-            }
-
-            // The install is no longer cancellable once every file has
-            // settled (succeeded, failed, or was already cancelled by
-            // CancelInstall, which removes this entry itself).
-            active_installs.lock().await.remove(&key);
-
-            if !failed {
-                // Epic sets this directly (launch_exe). GOG never does —
-                // in principle it's knowable post-download from a
-                // goggame-<id>.info file shipped as a depot file (see
-                // store.proto's doc comment), but that file isn't always
-                // present, so that lookup is kept as a first try, not
-                // relied on, and backed by a heuristic scan of the
-                // install root that doesn't depend on GOG providing
-                // anything extra.
-                let primary_executable = manifest
-                    .primary_executable
-                    .clone()
-                    .or_else(|| find_goggame_primary_executable(&c_drive, &relative_paths))
-                    .or_else(|| {
-                        find_primary_executable_heuristic(
-                            &relative_paths,
-                            &manifest.install_directory,
-                        )
-                    });
-
-                let program_id = match &primary_executable {
-                    Some(executable_relative) => {
-                        let windows_path =
-                            format!("C:\\{}", executable_relative.replace('/', "\\"));
-                        let name = std::path::Path::new(executable_relative)
-                            .file_stem()
-                            .and_then(|stem| stem.to_str())
-                            .unwrap_or(&game_id)
-                            .to_string();
-                        let program = bottles_core::Program::new(name, windows_path);
-                        let program_id = program.id.to_string();
-                        let mut edit = bottle.edit();
-                        edit.add_program(program);
-                        match edit.commit().await {
-                            Ok(()) => Some(program_id),
-                            Err(err) => {
+                        let program_id = match &primary_executable {
+                            Some(executable_relative) => {
+                                let windows_path =
+                                    format!("C:\\{}", executable_relative.replace('/', "\\"));
+                                let name = std::path::Path::new(executable_relative)
+                                    .file_stem()
+                                    .and_then(|stem| stem.to_str())
+                                    .unwrap_or(&game_id)
+                                    .to_string();
+                                let program = bottles_core::Program::new(name, windows_path);
+                                let program_id = program.id.to_string();
+                                let mut edit = bottle.edit();
+                                edit.add_program(program);
+                                match edit.commit().await {
+                                    Ok(()) => Some(program_id),
+                                    Err(err) => {
+                                        tracing::warn!(
+                                            "failed to register launch program for {game_id}: {err}"
+                                        );
+                                        None
+                                    }
+                                }
+                            }
+                            None => {
                                 tracing::warn!(
-                                    "failed to register launch program for {game_id}: {err}"
+                                    "couldn't determine a launch executable for {game_id}; installed without a Program"
                                 );
                                 None
                             }
+                        };
+
+                        let record = bottles_core::library::InstallRecord {
+                            profile_id: profile_id.clone(),
+                            storefront,
+                            game_id: game_id.clone(),
+                            version: manifest.version.clone(),
+                            install_size_bytes: manifest
+                                .install_size_bytes
+                                .or(Some(install_size_bytes)),
+                            bottle_id: bottle_id.clone(),
+                            relative_paths,
+                            program_id,
+                        };
+                        let install_state = record.install_state();
+                        match install_manager.record(record).await {
+                            Ok(()) => {
+                                let event = InstallGameEvent {
+                                    event: Some(install_game_event::Event::Done(install_state)),
+                                };
+                                let _ = tx.send(Ok(event)).await;
+                            }
+                            Err(err) => {
+                                let _ = tx.send(Err(err.into())).await;
+                            }
                         }
                     }
-                    None => {
-                        tracing::warn!(
-                            "couldn't determine a launch executable for {game_id}; installed without a Program"
-                        );
-                        None
-                    }
-                };
-
-                let record = InstallRecord {
-                    profile_id,
-                    storefront,
-                    game_id,
-                    version: manifest.version,
-                    install_size_bytes: manifest.install_size_bytes.or(install_size_bytes),
-                    bottle_id,
-                    relative_paths,
-                    program_id,
-                };
-                let install_state = record.install_state();
-                match installs.upsert(record).await {
-                    Ok(()) => {
-                        let event = InstallGameEvent {
-                            event: Some(install_game_event::Event::Done(install_state)),
-                        };
-                        let _ = tx.send(Ok(event)).await;
-                    }
                     Err(err) => {
-                        let _ = tx.send(Err(err.into())).await;
+                        let _ = tx.send(Err(Status::internal(err.to_string()))).await;
                     }
                 }
             }
@@ -509,21 +423,14 @@ impl Library for LibraryService {
             game_id,
             ..
         } = request.into_inner();
-        let key: InstallKey = (profile_id, storefront, game_id);
-
-        if let Some(downloads) = self.active_installs.lock().await.remove(&key) {
-            for download in downloads {
-                let _ = download.cancel().await;
-            }
-        }
-
+        self.install_manager
+            .cancel(&(profile_id, storefront, game_id))
+            .await;
         Ok(Response::new(()))
     }
 
-    /// Removes exactly the files this install wrote (from the
-    /// `InstallRecord`, not a directory sweep — the bottle's `C:` drive
-    /// is shared with every other game installed there) and the
-    /// registered launch `Program`, if any.
+    /// Removes exactly the files this install wrote and the registered
+    /// launch `Program`, if any — see `InstallManager::uninstall`.
     async fn uninstall_game(
         &self,
         request: Request<InstallGameRequest>,
@@ -537,31 +444,22 @@ impl Library for LibraryService {
         let storefront_enum = Storefront::try_from(storefront)
             .map_err(|_| Status::invalid_argument("invalid storefront"))?;
 
-        let Some(record) = self
-            .installs
-            .remove(&profile_id, storefront_enum, &game_id)
-            .await?
-        else {
-            return Ok(Response::new(()));
+        let bottle = match self
+            .install_manager
+            .get(&profile_id, storefront_enum, &game_id)
+            .await
+        {
+            Some(record) => match Uuid::parse_str(&record.bottle_id) {
+                Ok(bottle_uuid) => self.bottles.open(bottle_uuid).await.ok(),
+                Err(_) => None,
+            },
+            None => None,
         };
 
-        if let Ok(bottle_uuid) = Uuid::parse_str(&record.bottle_id)
-            && let Ok(bottle) = self.bottles.open(bottle_uuid).await
-        {
-            let c_drive = bottle.c_drive_path();
-            for relative_path in &record.relative_paths {
-                let _ = tokio::fs::remove_file(c_drive.join(relative_path)).await;
-            }
-            if let Some(program_id) = record.program_id.as_deref()
-                && let Ok(program_uuid) = Uuid::parse_str(program_id)
-            {
-                let mut edit = bottle.edit();
-                edit.remove_program(program_uuid);
-                if let Err(err) = edit.commit().await {
-                    tracing::warn!("failed to remove launch program for {game_id}: {err}");
-                }
-            }
-        }
+        self.install_manager
+            .uninstall(&profile_id, storefront_enum, &game_id, bottle)
+            .await
+            .map_err(Status::from)?;
 
         Ok(Response::new(()))
     }
@@ -673,52 +571,4 @@ fn find_primary_executable_heuristic(
         [only] => Some((**only).to_string()),
         _ => None,
     }
-}
-
-/// Concatenates a file's already-downloaded chunks, in order, into
-/// `destination`, decompressing each independently first when its
-/// manifest entry said it needed it (matches how GOG's — and Epic's —
-/// chunk formats work: each chunk is compressed on its own, not the
-/// concatenated whole). Returns the reassembled file's size. Leaves
-/// temp chunk files in place on error so a retry doesn't have to
-/// re-download them; removes them on success.
-async fn reassemble_file(
-    destination: &std::path::Path,
-    chunk_temp_paths: &[std::path::PathBuf],
-    chunk_compressed: &[bool],
-) -> std::io::Result<u64> {
-    use tokio::io::AsyncWriteExt;
-
-    if let Some(parent) = destination.parent() {
-        tokio::fs::create_dir_all(parent).await?;
-    }
-
-    let mut out = tokio::fs::File::create(destination).await?;
-    let mut total = 0u64;
-
-    for (temp_path, &compressed) in chunk_temp_paths.iter().zip(chunk_compressed) {
-        let bytes = tokio::fs::read(temp_path).await?;
-        let bytes = if compressed {
-            tokio::task::spawn_blocking(move || {
-                use std::io::Read;
-                let mut decoder = flate2::read::ZlibDecoder::new(&bytes[..]);
-                let mut decompressed = Vec::new();
-                decoder.read_to_end(&mut decompressed)?;
-                std::io::Result::Ok(decompressed)
-            })
-            .await
-            .map_err(std::io::Error::other)??
-        } else {
-            bytes
-        };
-
-        total += bytes.len() as u64;
-        out.write_all(&bytes).await?;
-    }
-
-    for temp_path in chunk_temp_paths {
-        let _ = tokio::fs::remove_file(temp_path).await;
-    }
-
-    Ok(total)
 }

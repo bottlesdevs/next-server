@@ -6,9 +6,14 @@
 
 use bottles_core::profile::{ProfileManager, error::ProfileError};
 use next_proto::bottles::{
-    accounts::v1::{LinkAccountRequest, UnlinkAccountRequest, accounts_server::Accounts},
+    accounts::v1::{
+        LinkAccountRequest, RefreshAccountRequest, UnlinkAccountRequest, accounts_server::Accounts,
+    },
     common::v1::{LinkedAccount, Storefront},
-    plugin::v1::{CompleteLoginRequest, RevokeSessionRequest, plugin_client::PluginClient},
+    plugin::v1::{
+        CompleteLoginRequest, RefreshSessionRequest, RevokeSessionRequest,
+        plugin_client::PluginClient,
+    },
     registry::v1::{ResolvePluginRequest, registry_client::RegistryClient},
 };
 use tokio::sync::Mutex;
@@ -17,7 +22,9 @@ use tonic::{Request, Response, Result, Status, async_trait, transport::Channel};
 fn to_status(err: bottles_core::Error) -> Status {
     match &err {
         bottles_core::Error::Status(status) => status.clone(),
-        bottles_core::Error::Profile(ProfileError::NotFound(_)) => Status::not_found(err.to_string()),
+        bottles_core::Error::Profile(ProfileError::NotFound(_)) => {
+            Status::not_found(err.to_string())
+        }
         _ => Status::internal(err.to_string()),
     }
 }
@@ -77,20 +84,14 @@ impl Accounts for AccountsService {
     ) -> Result<Response<LinkedAccount>, Status> {
         let req = request.into_inner();
 
-        self.manager
-            .ensure_exists(&req.profile_id)
-            .await
-            .map_err(to_status)?;
+        self.manager.get(&req.profile_id).await.map_err(to_status)?;
 
         let storefront = Storefront::try_from(req.storefront)
             .map_err(|_| Status::invalid_argument("invalid storefront"))?;
 
-        let mut client = self
-            .plugin_client_for(storefront)
-            .await?
-            .ok_or_else(|| {
-                Status::unavailable(format!("no plugin registered for {storefront:?}"))
-            })?;
+        let mut client = self.plugin_client_for(storefront).await?.ok_or_else(|| {
+            Status::unavailable(format!("no plugin registered for {storefront:?}"))
+        })?;
 
         let account = client
             .complete_login(CompleteLoginRequest {
@@ -107,6 +108,26 @@ impl Accounts for AccountsService {
             .await
             .map_err(to_status)?;
         Ok(Response::new(account))
+    }
+
+    async fn refresh_account(
+        &self,
+        request: Request<RefreshAccountRequest>,
+    ) -> Result<Response<LinkedAccount>, Status> {
+        let req = request.into_inner();
+        let storefront = Storefront::try_from(req.storefront)
+            .map_err(|_| Status::invalid_argument("invalid storefront"))?;
+        let mut client = self.plugin_client_for(storefront).await?.ok_or_else(|| {
+            Status::unavailable(format!("no plugin registered for {storefront:?}"))
+        })?;
+        let account = client
+            .refresh_session(RefreshSessionRequest {
+                profile_id: req.profile_id,
+                storefront: storefront as i32,
+            })
+            .await
+            .map_err(Status::from)?;
+        Ok(account)
     }
 
     async fn unlink_account(
@@ -131,7 +152,9 @@ impl Accounts for AccountsService {
                         tracing::warn!("{storefront:?} RevokeSession failed: {err}");
                     }
                 }
-                Ok(None) => tracing::debug!("no plugin registered for {storefront:?}, skipping revoke"),
+                Ok(None) => {
+                    tracing::debug!("no plugin registered for {storefront:?}, skipping revoke")
+                }
                 Err(err) => tracing::warn!("failed to reach {storefront:?} plugin: {err}"),
             }
         }
