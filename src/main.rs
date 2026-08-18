@@ -1,10 +1,7 @@
 use std::{sync::Arc, time::Duration};
 
 use bottles_core::{
-    accounts::AccountManager,
-    library::{InstallManager, InstallsStore},
-    profile::ProfileManager,
-    steam::SteamManager,
+    accounts::AccountManager, library::LibraryManager, profile::ProfileManager, steam::SteamManager,
 };
 use bottles_server::{
     accounts::AccountsService, bottle::BottleService, library::LibraryService,
@@ -12,12 +9,9 @@ use bottles_server::{
 };
 use download_manager::manager::{DownloadManager, DownloadManagerConfig};
 use next_proto::bottles::{
-    accounts::v1::accounts_server::AccountsServer,
-    bottle::v1::bottle_server::BottleServer,
-    library::v1::library_server::LibraryServer,
-    plugin::v1::plugin_server::PluginServer,
-    profiles::v1::profile_server::ProfileServer,
-    registry::v1::registry_client::RegistryClient,
+    accounts::v1::accounts_server::AccountsServer, bottle::v1::bottle_server::BottleServer,
+    library::v1::library_server::LibraryServer, plugin::v1::plugin_server::PluginServer,
+    profiles::v1::profile_server::ProfileServer, registry::v1::registry_client::RegistryClient,
     steam::v1::steam_server::SteamServer,
 };
 use tonic_health::server::health_reporter;
@@ -80,8 +74,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         DownloadManager::new(http_client, DownloadManagerConfig::default())
             .map_err(|err| format!("failed to start download manager: {err}"))?,
     );
-    let installs = Arc::new(InstallsStore::load().await?);
-    let install_manager = Arc::new(InstallManager::new(downloads, installs));
+    let installs = Arc::new(LibraryManager::load().await?);
 
     let bottles = bottles_core::Bottles::open(bottles_core::Config::default()).await?;
     let bottle_service = BottleService::new(bottles.bottles().clone());
@@ -90,7 +83,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let profile = ProfileManager::new().await?;
     let library_service = LibraryService::new(
         library_registry_client,
-        install_manager,
+        downloads,
+        installs,
         profile,
         bottles.bottles().clone(),
     );
