@@ -282,41 +282,26 @@ impl Library for LibraryService {
             .await?
             .into_inner();
 
-        // Depot file paths are flat (no game-named prefix of their
-        // own) — install under the storefront's own canonical folder
-        // name, matching where its official client would put them,
-        // rather than dumping files straight at the drive root.
-        //
-        // `install_directory` and every file's `relative_path` come
-        // from the storefront plugin's manifest response — a separate,
-        // dynamically-resolved process relaying storefront-CDN data,
-        // not trusted input. Reject anything that isn't a plain relative
-        // path *before* it's ever joined onto the bottle's `C:` drive or
-        // persisted, so a malicious/compromised plugin can't traverse
-        // out of the install directory to write (or later, on
-        // uninstall, delete) arbitrary files on the host.
-        let install_directory = bottles_core::library::sanitize_relative_path(
-            &manifest.install_directory,
-        )
-        .ok_or_else(|| Status::invalid_argument("invalid install_directory in manifest"))?;
-        let install_root_name = format!("Program Files/{}", install_directory.display());
-        let destination_root = c_drive.join(&install_root_name);
+        let install_root =
+            bottles_core::library::install_root_relative_path(storefront_enum, &game_id)
+                .ok_or_else(|| Status::invalid_argument("invalid game_id"))?;
+        let install_root_name = install_root.to_string_lossy().into_owned();
+        let destination_root = c_drive.join(&install_root);
 
         let files = manifest
             .files
             .iter()
             .map(|file| {
-                let relative_path = bottles_core::library::sanitize_relative_path(
-                    &file.relative_path,
-                )
-                .ok_or_else(|| {
-                    Status::invalid_argument(format!(
-                        "invalid relative_path in manifest: {}",
-                        file.relative_path
-                    ))
-                })?
-                .to_string_lossy()
-                .into_owned();
+                let relative_path =
+                    bottles_core::library::sanitize_relative_path(&file.relative_path)
+                        .ok_or_else(|| {
+                            Status::invalid_argument(format!(
+                                "invalid relative_path in manifest: {}",
+                                file.relative_path
+                            ))
+                        })?
+                        .to_string_lossy()
+                        .into_owned();
                 let chunks = file
                     .chunks
                     .iter()
@@ -437,7 +422,11 @@ impl Library for LibraryService {
                 .clone()
                 .or_else(|| find_goggame_primary_executable(&c_drive, &relative_paths))
                 .or_else(|| {
-                    find_primary_executable_heuristic(&relative_paths, &manifest.install_directory)
+                    find_primary_executable_heuristic(
+                        &relative_paths,
+                        &install_root_name,
+                        &manifest.install_directory,
+                    )
                 });
 
             let program_id = match &primary_executable {
@@ -464,9 +453,7 @@ impl Library for LibraryService {
                             }
                         }
                         Err(err) => {
-                            tracing::warn!(
-                                "invalid launch program for {game_id}: {err}"
-                            );
+                            tracing::warn!("invalid launch program for {game_id}: {err}");
                             None
                         }
                     }
@@ -486,7 +473,6 @@ impl Library for LibraryService {
                 version: manifest.version.clone(),
                 install_size_bytes: manifest.install_size_bytes.or(Some(install_size_bytes)),
                 bottle_id: bottle_id.clone(),
-                relative_paths,
                 program_id,
             };
             let install_state = record.install_state();
@@ -605,19 +591,12 @@ fn find_goggame_primary_executable(
 /// says so outright. Only looks directly inside the install root (not
 /// subdirectories — redist installers, launchers, and crash handlers
 /// routinely ship their own nested `.exe`s that aren't the game).
-///
-/// Prefers an exact case-insensitive match between a candidate's file
-/// stem and the install directory name (GOG's own convention in
-/// practice: "Hollow Knight" installs "Hollow Knight.exe" at its
-/// root); falls back to the single remaining candidate once obvious
-/// non-game helpers (crash handlers, uninstallers, redist installers)
-/// are filtered out, but refuses to guess when more than one
-/// candidate remains — a wrong launch target is worse than none.
 fn find_primary_executable_heuristic(
     relative_paths: &[String],
+    install_root_name: &str,
     install_directory: &str,
 ) -> Option<String> {
-    let root_prefix = format!("Program Files/{install_directory}/");
+    let root_prefix = format!("{install_root_name}/");
 
     let candidates: Vec<&str> = relative_paths
         .iter()

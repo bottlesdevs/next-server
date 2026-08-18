@@ -1,8 +1,6 @@
 use std::{sync::Arc, time::Duration};
 
-use bottles_core::{
-    accounts::AccountManager, library::LibraryManager, profile::ProfileManager, steam::SteamManager,
-};
+use bottles_core::{accounts::AccountManager, library::LibraryManager, steam::SteamManager};
 use bottles_server::{
     accounts::AccountsService, bottle::BottleService, library::LibraryService,
     plugin::PluginService, profile::ProfileService, steam_service::SteamService,
@@ -80,19 +78,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let bottle_service = BottleService::new(bottles.bottles().clone());
 
     let library_registry_client = RegistryClient::connect(REGISTRY_ENDPOINT).await?;
-    let profile = ProfileManager::new().await?;
+    let profile_manager = bottles.profiles().clone();
     let library_service = LibraryService::new(
         library_registry_client,
         downloads,
         installs,
-        profile,
+        profile_manager.clone(),
         bottles.bottles().clone(),
     );
 
     let plugin_registry_client = RegistryClient::connect(REGISTRY_ENDPOINT).await?;
     let plugin_service = PluginService::new(plugin_registry_client);
-
-    let profile_manager = ProfileManager::new().await?;
 
     let profile_service = ProfileService::new(profile_manager.clone());
 
